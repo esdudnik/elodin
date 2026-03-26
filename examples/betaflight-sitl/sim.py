@@ -211,9 +211,21 @@ def create_apply_forces_system(config: DroneConfig):
     - Motor thrust (body frame, rotated to world)
     - Drag (world frame)
     - Gravity (world frame)
+    - Multi-point ground contact (spring-damper at 4 landing points)
+    - Propwash / ground effect (near ground, when motors spinning)
     """
     gravity_vec = jnp.array([0.0, 0.0, -config.gravity])
     angular_drag = jnp.array(config.angular_drag)
+    ge_height = config.ground_effect_height
+    ge_force_std = config.ground_effect_force_std
+    ge_torque_std = config.ground_effect_torque_std
+    ground_level = config.ground_level
+
+    # Multi-point ground contact: 4 points at arm undersides
+    contact_pts_body = jnp.array(config.contact_points)  # (4, 3) in body FLU
+    contact_k = config.contact_stiffness
+    contact_c = config.contact_damping
+    contact_fric = config.contact_friction
 
     @el.map
     def apply_forces(
@@ -223,6 +235,7 @@ def create_apply_forces_system(config: DroneConfig):
         vel: el.WorldVel,
         inertia: el.Inertia,
         force: el.Force,
+        sim_time: SimTime,
     ) -> el.Force:
         """Apply all forces to the body."""
         # Rotate body thrust to world frame
@@ -241,51 +254,111 @@ def create_apply_forces_system(config: DroneConfig):
         angular_drag_torque = -angular_drag * omega_mag * omega
         angular_drag_force = el.SpatialForce(torque=angular_drag_torque)
 
+        # --- Multi-point ground contact ---
+        # For each of the 4 contact points: transform to world, check penetration,
+        # apply spring-damper normal force + lateral friction.
+        # Forces are computed in world frame, torques from body-frame lever arms.
+        com_pos = pos.linear()
+        com_vel = vel.linear()
+        omega_world = vel.angular()
+
+        total_contact_force = jnp.zeros(3)
+        total_contact_torque = jnp.zeros(3)
+
+        def contact_point_force(i, carry):
+            """Compute contact force for one point and accumulate."""
+            acc_force, acc_torque = carry
+
+            # Transform contact point from body to world frame
+            pt_body = contact_pts_body[i]
+            pt_world = com_pos + quat @ pt_body
+
+            # Velocity at contact point: v_com + omega × r (world frame)
+            r_world = quat @ pt_body  # offset from CoM in world frame
+            pt_vel = com_vel + jnp.cross(omega_world, r_world)
+
+            # Penetration depth (positive when below ground)
+            penetration = ground_level - pt_world[2]
+            in_contact = penetration > 0.0
+
+            # Normal force: spring + damper, clamped non-negative (unilateral)
+            f_spring = contact_k * penetration
+            f_damper = -contact_c * pt_vel[2]  # damp vertical velocity at point
+            f_normal = jnp.maximum(f_spring + f_damper, 0.0)
+            f_normal = jnp.where(in_contact, f_normal, 0.0)
+
+            # Lateral friction: viscous damping of horizontal velocity at point
+            # Only when in contact
+            f_friction_x = jnp.where(in_contact, -contact_fric * pt_vel[0], 0.0)
+            f_friction_y = jnp.where(in_contact, -contact_fric * pt_vel[1], 0.0)
+
+            # Total force at this contact point (world frame)
+            pt_force_world = jnp.array([f_friction_x, f_friction_y, f_normal])
+
+            # Torque from off-center force: tau = r × F (world frame)
+            pt_torque_world = jnp.cross(r_world, pt_force_world)
+
+            return (acc_force + pt_force_world, acc_torque + pt_torque_world)
+
+        total_contact_force, total_contact_torque = jax.lax.fori_loop(
+            0, 4, contact_point_force, (total_contact_force, total_contact_torque)
+        )
+
+        # Contact forces and torques are in world frame (matching el.SpatialForce convention)
+        ground_contact_force = el.SpatialForce(
+            linear=total_contact_force,
+            torque=total_contact_torque,
+        )
+
+        # Ground effect: mild turbulent force perturbation near ground
+        # (The main ground effect is baro pressure bias in sensors.py)
+        agl = pos.linear()[2] - ground_level
+        proximity = jnp.clip((ge_height - agl) / ge_height, 0.0, 1.0)
+        total_thrust_mag = jnp.sum(jnp.abs(thrust.linear()))
+        intensity = proximity * proximity * jnp.clip(total_thrust_mag / (inertia.mass() * 9.81), 0.0, 1.0)
+
+        t = sim_time[0] * 1000.0
+        ge_fx = jnp.sin(t * 7.13 + 0.0) * ge_force_std * intensity
+        ge_fy = jnp.sin(t * 11.37 + 2.1) * ge_force_std * intensity
+        ge_fz = jnp.sin(t * 5.79 + 4.2) * ge_force_std * intensity
+        ge_tx = jnp.sin(t * 13.41 + 1.0) * ge_torque_std * intensity
+        ge_ty = jnp.sin(t * 9.23 + 3.3) * ge_torque_std * intensity
+        ge_tz = jnp.sin(t * 6.89 + 5.5) * ge_torque_std * intensity
+        ground_effect_force = el.SpatialForce(
+            linear=jnp.array([ge_fx, ge_fy, ge_fz]),
+            torque=jnp.array([ge_tx, ge_ty, ge_tz]),
+        )
+
         # Sum all forces
-        return force + world_thrust + gravity_force + drag_force + angular_drag_force
+        return force + world_thrust + gravity_force + drag_force + angular_drag_force + ground_contact_force + ground_effect_force
 
     return apply_forces
 
 
 def create_ground_constraint_system(config: DroneConfig):
     """
-    Create ground collision constraint with friction.
+    Minimal anti-tunneling safety clamp.
 
-    Prevents the drone from going below ground level.
-    When on/near ground, applies angular damping to simulate ground contact
-    friction that prevents tipping. The damping gradually decreases with
-    altitude to provide a smooth transition from ground to flight.
+    The primary ground stabilization is now handled by the multi-point contact
+    forces in apply_forces. This post-integration clamp is only a safety net
+    to prevent the center of mass from tunneling through the ground plane
+    due to numerical integration overshoot.
+
+    No angular damping — attitude stabilization on ground comes from the
+    distributed contact forces creating natural restoring torques.
     """
     ground_level = config.ground_level
-    # Ground contact angular damping factor (0-1, higher = more damping)
-    # 0.95 means 95% of angular velocity is removed each timestep when on ground
-    max_damping = 0.95
-    # Height at which damping starts (on ground)
-    damping_start = ground_level + 0.01
-    # Height at which damping ends (in flight) - gradual transition over 0.5m
-    damping_end = ground_level + 0.5
 
     @el.map
     def ground_constraint(pos: el.WorldPos, vel: el.WorldVel) -> tuple[el.WorldPos, el.WorldVel]:
-        """Apply ground constraint with gradual angular damping."""
+        """Anti-tunneling clamp: prevent CoM from going below ground."""
         p = pos.linear()
         v = vel.linear()
-        omega = vel.angular()
 
-        # If below ground, clamp position and zero downward velocity
+        # Clamp position to ground level
         below_ground = p[2] < ground_level
         new_z = jnp.where(below_ground, ground_level, p[2])
         new_vz = jnp.where(below_ground & (v[2] < 0), 0.0, v[2])
-
-        # Gradual damping transition based on altitude
-        # damping_factor goes from max_damping at ground to 0 at damping_end
-        damping_ratio = jnp.clip((damping_end - p[2]) / (damping_end - damping_start), 0.0, 1.0)
-        damping_factor = max_damping * damping_ratio
-
-        # Apply damping: omega * (1 - damping_factor)
-        # At ground: omega * 0.05 (95% removed)
-        # At 0.5m: omega * 1.0 (no damping)
-        new_omega = omega * (1.0 - damping_factor)
 
         new_pos = el.SpatialTransform(
             linear=jnp.array([p[0], p[1], new_z]),
@@ -293,7 +366,7 @@ def create_ground_constraint_system(config: DroneConfig):
         )
         new_vel = el.SpatialMotion(
             linear=jnp.array([v[0], v[1], new_vz]),
-            angular=new_omega,
+            angular=vel.angular(),  # no angular modification
         )
 
         return new_pos, new_vel

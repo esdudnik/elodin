@@ -40,3 +40,96 @@ For in-depth instructions, read the relevant skill file below when working in th
 - **Python SDK internals** (PyO3 bindings, nox-py, JAX integration, adding components/systems): `.cursor/skills/nox-py-dev/SKILL.md`
 - **Nix environment** (dev shell troubleshooting, OrbStack VMs, flake.nix, binary cache): `.cursor/skills/elodin-nix/SKILL.md`
 - **IREE runtime** (iree-runtime crate, VMFB execution from Rust, FFI bindings, dual-backend architecture): `.cursor/skills/elodin-iree/SKILL.md`
+
+## Architecture
+
+- **Workspace:** 57 Cargo crates with `cargo elodin` / `cargo elodin-db` aliases
+- **Dual execution backends:** IREE (default, fast, no GIL) and JAX (fallback, full compatibility)
+- **Impeller2:** zero-copy pub-sub protocol for telemetry (FNV-1a hashed component IDs)
+- **Editor:** Bevy + Egui with modular plugin architecture and KDL schematic hot-reload
+- **s10:** process orchestrator -- manages sim subprocess and external processes (e.g. Betaflight SITL)
+- **Stellarator:** deterministic single-threaded async runtime for flight software
+- **Roci:** composable flight software framework with pipe-based system composition
+- Rust edition 2024, toolchain 1.90.0
+
+## Running Betaflight SITL Simulation
+
+The `run.sh` script in this directory handles building and running the elodin editor with the betaflight-sitl example. Must be run from the elodin directory root.
+
+### Prerequisites (one-time)
+```bash
+nix develop                    # Enter nix shell (required)
+source $NIX_SHELLRC            # Load shell functions
+install-elodin                 # Build everything (Python SDK + binaries)
+```
+
+### Using run.sh
+
+```bash
+./run.sh build-bf         # Clean + build betaflight SITL .elf
+./run.sh rebuild-elodin   # Rebuild elodin Python SDK + editor binary
+./run.sh run              # Run editor with betaflight-sitl example (skip rebuild)
+./run.sh all              # build-bf + rebuild-elodin + run (default)
+./run.sh check            # Analyze log file at /tmp/bf-elodin.log
+```
+
+`rebuild-elodin` requires `nix develop` shell. `build-bf` and `run` do not.
+
+### What run.sh does
+- **build-bf**: Installs ARM SDK (if needed), cleans and builds betaflight SITL binary (`make TARGET=SITL`) from the top-level `../betaflight/` directory
+- **rebuild-elodin**: Detects nix Python 3.13, creates `.venv`, builds nox-py wheel via `maturin develop`, installs elodin editor binary via `cargo install`
+- **run**: Activates venv, runs `elodin editor examples/betaflight-sitl/main.py`
+
+### Manual run (alternative)
+```bash
+nix develop
+source $NIX_SHELLRC
+source .venv/bin/activate
+export PATH="$HOME/.cargo/bin:$PATH"
+unset PYTHONPATH
+elodin editor examples/betaflight-sitl/main.py
+```
+
+See `run.md` for the full manual setup guide.
+
+### Environment Requirements
+- `.venv` **must** use Python 3.13 (matches nix's Python for PyO3 linkage)
+- `PYTHONPATH` must be unset (prevents numpy conflicts)
+- `uv` for all Python package management (inside nix shell)
+- `hidapi` pip package required for TX12 joystick input
+
+## Betaflight SITL Integration
+
+Located in `examples/betaflight-sitl/`. Key files:
+
+| File | Purpose |
+|------|---------|
+| `main.py` | Entry point: spawns drone, ground entity, joystick input, runs world |
+| `sim.py` | Physics: motor dynamics, 6-DOF rigid body, quadratic drag, ground collision |
+| `comms.py` | FDM packet parsing, MSP protocol, UDP lockstep communication |
+| `sensors.py` | Simulated IMU, barometer, airspeed sensor |
+| `config.py` | Simulation parameters (time step, motor constants, drag coefficients) |
+
+### Communication Ports
+- **UDP 9002**: PWM/motor commands from Betaflight SITL
+- **UDP 9003**: FDM packets (sensors) to Betaflight SITL
+- **TCP 5761**: MSP protocol (Configurator, joystick)
+
+### How it works
+1. `elodin editor` reads `main.py`, generates s10.toml (process orchestration plan)
+2. s10 spawns: Python sim subprocess + Betaflight SITL binary
+3. Sim starts elodin-db on port 2240, editor connects via TCP
+4. Physics loop: receive motor commands (UDP) -> simulate step -> send FDM sensors (UDP)
+5. Joystick: TX12 via hidapi (VID=0x1209 PID=0x4F54) sends RC channels via MSP
+
+### Current State
+- Backend: `jax` (IREE does not support all JAX features used)
+- Sim speed: ~0.3x realtime at 1kHz time step
+- Sim time step: 0.001s (1 kHz, configured in `config.py`)
+- 3D viewport: working (requires fixes in `libs/db/src/lib.rs` and `libs/impeller2/bevy/src/lib.rs`)
+- Joystick: working (TX12 USB HID via hidapi)
+
+## Reference Documentation
+
+- **`help/changes.md`** -- All local modifications after pulling from remote, organized by category with rationale
+- **`help/betaflight.md`** -- Betaflight flight controller reference: SITL target, packet structures, motor mapping, key source files

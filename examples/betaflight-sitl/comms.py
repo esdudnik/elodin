@@ -781,8 +781,8 @@ class BetaflightSyncBridge:
         accel_ned = np.array(
             [
                 -linear_acceleration[0],  # BF: -(-X) = X
-                linear_acceleration[1],  # BF: -Y
-                linear_acceleration[2],  # BF: -Z
+                linear_acceleration[1],  # BF: -(Y) = -Y
+                -linear_acceleration[2],  # BF: -(-Z) = +Z  (at rest: +g, gravity down)
             ]
         )
 

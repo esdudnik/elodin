@@ -751,14 +751,26 @@ pub fn advance_playback(
     earliest: Res<EarliestTimestamp>,
 ) {
     if paused.0 {
+        tracing::trace!("advance_playback: paused");
         return;
     }
     if earliest.0 >= last_updated.0 {
+        tracing::trace!(
+            earliest = ?earliest.0,
+            last_updated = ?last_updated.0,
+            "advance_playback: earliest >= last_updated, playback stuck"
+        );
         return;
     }
     let delta_micros = (time.delta_secs_f64() * speed.0 * 1_000_000.0) as i64;
     let new_ts = Timestamp(current_ts.0.0.saturating_add(delta_micros));
     current_ts.0 = Timestamp(new_ts.0.clamp(earliest.0.0, last_updated.0.0));
+    tracing::trace!(
+        ?new_ts,
+        earliest = ?earliest.0,
+        last_updated = ?last_updated.0,
+        "advance_playback: advancing"
+    );
 }
 
 pub fn sync_pos(
@@ -938,7 +950,7 @@ fn sync_object_3d(
                 mesh_visibility_range: None,
                 aux: (),
             },
-            expr,
+            Some(expr),
             &ctx.0,
             &mut material_assets,
             &mut mesh_assets,

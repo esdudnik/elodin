@@ -121,7 +121,8 @@ class DroneConfig:
     linear_drag: NDArray[np.float64] = field(default_factory=lambda: np.array([0.2, 0.2, 0.3]))
 
     # Rotational drag coefficient [drag_roll, drag_pitch, drag_yaw] in N*m/(rad/s)
-    angular_drag: NDArray[np.float64] = field(default_factory=lambda: np.array([0.01, 0.01, 0.015]))
+    # Includes aerodynamic prop drag that provides angular damping in flight
+    angular_drag: NDArray[np.float64] = field(default_factory=lambda: np.array([0.1, 0.1, 0.15]))
 
     # --- Initial State ---
 
@@ -144,9 +145,9 @@ class DroneConfig:
 
     # Physics time step in seconds (8kHz for high-performance Betaflight PID loop)
     # sim_time_step: float = 0.000125  # 8kHz = 125µs
-    sim_time_step: float = 0.000250  # 4kHz = 250µs
+    # sim_time_step: float = 0.000250  # 4kHz = 250µs
     # sim_time_step: float = 0.000500  # 2kHz = 500µs
-    # sim_time_step: float = 0.001000  # 1kHz = 1000µs
+    sim_time_step: float = 0.001000  # 1kHz = 1000µs
 
     # Total simulation time in seconds
     simulation_time: float = 15.0
@@ -164,8 +165,8 @@ class DroneConfig:
     # Accelerometer rate (BMI270: 1.6kHz × 3 IMUs = ~4.8kHz effective)
     accel_rate: float = 4800.0
 
-    # Barometer rate (BMP581: up to 480Hz continuous mode)
-    baro_rate: float = 480.0
+    # Barometer rate — matches BF's TASK_BARO_RATE_HZ (40Hz)
+    baro_rate: float = 40.0
 
     # Magnetometer rate (BMM350: ~200Hz)
     mag_rate: float = 200.0
@@ -180,6 +181,22 @@ class DroneConfig:
 
     # Ground level in meters
     ground_level: float = 0.0
+
+    # Ground effect / propwash parameters
+    # Props blow air down → bounces off ground → increases pressure at baro sensor
+    # → baro reads LOWER altitude → ALT_HOLD over-thrusts → "fly to moon" on takeoff
+    ground_effect_height: float = 0.50   # meters — effect zone AGL
+    ground_effect_baro_bias: float = 0.0   # DIAGNOSTIC: zeroed to isolate liftoff instability
+    ground_effect_force_std: float = 0.0   # DIAGNOSTIC: zeroed to isolate liftoff instability
+    ground_effect_torque_std: float = 0.0  # DIAGNOSTIC: zeroed to isolate liftoff instability
+
+    # Ground contact model parameters (multi-point spring-damper)
+    # Contact points are at motor XY positions but offset below body center
+    # to represent where arm undersides / landing gear touch the ground.
+    contact_z_offset: float = -0.02        # meters below body center (arm underside)
+    contact_stiffness: float = 800.0       # N/m per contact point (vertical spring)
+    contact_damping: float = 15.0          # N/(m/s) per contact point (vertical damper)
+    contact_friction: float = 0.0          # N/(m/s) lateral friction (zeroed for tuning)
 
     # --- Computed Properties ---
 
@@ -286,6 +303,21 @@ class DroneConfig:
             motor[3] = BR: CW  = -1
         """
         return np.array([1.0, 1.0, -1.0, -1.0])
+
+    @property
+    def contact_points(self) -> NDArray[np.float64]:
+        """
+        Ground contact points in body FLU frame.
+
+        Same XY footprint as motors, but offset below body center to represent
+        where arm undersides or landing gear touch the ground.
+
+        Returns:
+            Array of shape (4, 3) with contact positions [x, y, z] in body FLU
+        """
+        pts = self.motor_positions.copy()
+        pts[:, 2] = self.contact_z_offset
+        return pts
 
     @property
     def motor_torque_axes(self) -> NDArray[np.float64]:

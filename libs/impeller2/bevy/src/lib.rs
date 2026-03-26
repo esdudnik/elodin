@@ -115,6 +115,14 @@ impl TelemetryCache {
     pub fn component_ids(&self) -> impl Iterator<Item = &ComponentId> {
         self.components.keys()
     }
+
+    pub fn entry_count(&self, component_id: &ComponentId) -> usize {
+        self.components.get(component_id).map_or(0, |s| s.len())
+    }
+
+    pub fn total_entries(&self) -> usize {
+        self.components.values().map(|s| s.len()).sum()
+    }
 }
 
 /// Decomponentize implementation that collects component values into a
@@ -152,6 +160,7 @@ pub fn apply_cached_data(
     adapters: bevy::prelude::Res<ComponentAdapters>,
     mut commands: Commands,
     mut last_applied: bevy::prelude::Local<(Timestamp, u64)>,
+    mut frame_count: bevy::prelude::Local<u32>,
 ) {
     let ts = current_ts.0;
     let cache_gen = cache.generation;
@@ -159,11 +168,16 @@ pub fn apply_cached_data(
         return;
     }
     *last_applied = (ts, cache_gen);
+    let mut applied_count = 0u32;
+    let mut skipped_no_value = 0u32;
+    let mut skipped_no_entity = 0u32;
     for component_id in cache.component_ids().copied().collect::<Vec<_>>() {
         let Some(value) = cache.get_at_or_before(&component_id, ts) else {
+            skipped_no_value += 1;
             continue;
         };
         let Some(&entity) = entity_map.get(&component_id) else {
+            skipped_no_entity += 1;
             continue;
         };
         if let Ok(mut cv) = query.get_mut(entity) {
@@ -175,6 +189,30 @@ pub fn apply_cached_data(
             let view = value.as_view();
             adapter.insert(&mut commands, &mut entity_map, component_id, view);
         }
+        applied_count += 1;
+    }
+    bevy::log::trace!(
+        ?ts,
+        cache_gen,
+        applied_count,
+        skipped_no_value,
+        skipped_no_entity,
+        total_components = cache.component_ids().count(),
+        entity_map_size = entity_map.len(),
+        "apply_cached_data summary"
+    );
+    // Periodic diagnostic: log cache depth every 100 frames
+    *frame_count += 1;
+    if *frame_count % 100 == 0 {
+        let depths: Vec<String> = cache.component_ids()
+            .map(|cid| format!("{:?}={}", cid, cache.entry_count(cid)))
+            .collect();
+        bevy::log::trace!(
+            ?ts,
+            cache_gen,
+            total_entries = cache.total_entries(),
+            "cache depth: [{}]", depths.join(", ")
+        );
     }
 }
 
@@ -272,6 +310,7 @@ fn sink_inner(
     world_sink_state: &mut SystemState<WorldSink>,
 ) -> Result<(), impeller2::error::Error> {
     let mut count = 0;
+    let mut table_count = 0u32;
     let mut pending_cache_entries: Vec<(ComponentId, Timestamp, ComponentValue)> = Vec::new();
     while let Some(pkt) = packet_rx.try_recv_pkt() {
         if count > 2048 {
@@ -284,6 +323,12 @@ fn sink_inner(
                 OwnedPacket::Table(table) => table.id,
                 OwnedPacket::TimeSeries(time_series) => time_series.id,
             };
+            let pkt_type = match &pkt {
+                OwnedPacket::Msg(_) => "Msg",
+                OwnedPacket::Table(_) => "Table",
+                OwnedPacket::TimeSeries(_) => "TimeSeries",
+            };
+            bevy::log::trace!(pkt_id = ?pkt_id, pkt_type, "sink_inner: received packet");
             let handler = world
                 .get_resource_mut::<PacketIdHandlers>()
                 .and_then(|mut handlers| handlers.remove(&pkt_id));
@@ -332,6 +377,14 @@ fn sink_inner(
         match &pkt {
             OwnedPacket::Msg(m) if m.id == VTableMsg::ID => {
                 let vtable = m.parse::<VTableMsg>()?;
+                let fields_count = vtable.vtable.fields.as_slice().len();
+                let was_present = vtable_registry.map.contains_key(&vtable.id);
+                bevy::log::trace!(
+                    vtable_id = ?vtable.id,
+                    fields_count,
+                    was_present,
+                    "sink: VTableMsg registered"
+                );
                 vtable_registry.map.insert(vtable.id, vtable.vtable);
             }
             OwnedPacket::Msg(m) if m.id == ComponentMetadata::ID => {
@@ -369,6 +422,11 @@ fn sink_inner(
             }
             OwnedPacket::Msg(m) if m.id == LastUpdated::ID => {
                 let m = m.parse::<LastUpdated>()?;
+                bevy::log::trace!(
+                    received = ?m.0,
+                    current = ?world_sink.max_tick.0,
+                    "sink: LastUpdated message received"
+                );
                 // Keep LastUpdated monotonic on the client. In mixed/reconnect
                 // conditions, out-of-order packets can otherwise move the
                 // playback clock backward and cause visible pose flicker.
@@ -385,15 +443,42 @@ fn sink_inner(
                 world_sink.schema_reg.0.extend(dump_schema.schemas);
             }
             OwnedPacket::Table(table) => {
+                table_count += 1;
+                let table_buf_len = stellarator_buf::deref(&table.buf).len();
+                let vtable_found = vtable_registry.map.contains_key(&table.id);
+                let vtable_fields = vtable_registry.map.get(&table.id)
+                    .map(|vt| vt.fields.as_slice().len())
+                    .unwrap_or(0);
                 let mut collector = CacheCollector {
                     collected: Vec::new(),
                 };
-                let _ = table.sink(vtable_registry, &mut collector);
+                if let Err(err) = table.sink(vtable_registry, &mut collector) {
+                    bevy::log::warn!(table_count, %err, "sink: table.sink(collector) failed");
+                }
+                let collected_count = collector.collected.len();
+                if table_count <= 5 || table_count % 1000 == 0 || (collected_count == 0 && table_count <= 20) {
+                    bevy::log::trace!(
+                        table_count,
+                        collected_count,
+                        table_id = ?table.id,
+                        table_buf_len,
+                        vtable_found,
+                        vtable_fields,
+                        "sink: Table received"
+                    );
+                }
                 pending_cache_entries.extend(collector.collected);
-                let _ = table.sink(vtable_registry, &mut world_sink)?;
+                if let Err(err) = table.sink(vtable_registry, &mut world_sink) {
+                    bevy::log::warn!(table_count, %err, "sink: table.sink(world_sink) failed");
+                }
             }
             OwnedPacket::Msg(m) if m.id == EarliestTimestamp::ID => {
                 let new_earliest = m.parse::<EarliestTimestamp>()?;
+                bevy::log::trace!(
+                    received = ?new_earliest.0,
+                    current = ?world_sink.earliest_timestamp.0,
+                    "sink: EarliestTimestamp message received"
+                );
                 let is_first = world_sink.earliest_timestamp.0 == Timestamp(i64::MAX);
                 if is_first {
                     *world_sink.earliest_timestamp = new_earliest;

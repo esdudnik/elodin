@@ -38,6 +38,7 @@ __pycache__
 # examples
 betaflight_*
 eeprom.bin
+e2e_test_db
 
 examples/rocket-barrowman/motor_cache/
 examples/rocket-barrowman/*.log

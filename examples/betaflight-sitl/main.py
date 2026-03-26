@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,17 +42,70 @@ from comms import (
 )
 
 
+# --- Joystick Input (Radiomaster TX12 via USB HID) ---
+# OpenTX USB joystick HID report: 3 header bytes + 8x 16-bit LE channels (0-2047)
+# Channel order (AETR): Roll, Pitch, Throttle, Yaw, AUX1-4
+# Betaflight RC range: 1000 to 2000 (center=1500)
+
+TX12_VID = 0x1209
+TX12_PID = 0x4F54
+HID_REPORT_OFFSET = 3  # Skip 3 header bytes
+HID_AXIS_MAX = 2047  # OpenTX 11-bit range
+
+# Shared joystick channel values (written by joystick thread, read by sim)
+_js_channels = np.full(MAX_RC_CHANNELS, 1500, dtype=np.uint16)
+_js_channels[2] = 1000  # Throttle starts at minimum
+_js_connected = [False]
+
+
+def _joystick_thread():
+    """Background thread that reads the TX12 via hidapi at ~200Hz."""
+    import struct
+    try:
+        import hid
+    except ImportError:
+        print("[JOYSTICK] hidapi not installed (pip install hidapi) - using scripted RC")
+        return
+    try:
+        device = hid.device()
+        device.open(TX12_VID, TX12_PID)
+        device.set_nonblocking(True)
+        name = f"{device.get_manufacturer_string()} {device.get_product_string()}"
+        print(f"[JOYSTICK] {name} (8 channels via HID)")
+        _js_connected[0] = True
+        while _js_connected[0]:
+            data = device.read(64)
+            if data and len(data) >= HID_REPORT_OFFSET + 16:
+                raw = bytes(data)
+                axes = struct.unpack_from("<8H", raw, HID_REPORT_OFFSET)
+                # Convert 0-2047 to 1000-2000 RC PWM
+                for i in range(8):
+                    _js_channels[i] = 1000 + (axes[i] * 1000) // HID_AXIS_MAX
+            time.sleep(0.005)  # 200Hz polling
+        device.close()
+    except Exception as e:
+        print(f"[JOYSTICK] Error: {e} - using scripted RC")
+
+
+# Start joystick thread
+_js_thread = threading.Thread(target=_joystick_thread, daemon=True)
+_js_thread.start()
+time.sleep(0.2)  # Let it detect the joystick
+
+
 # --- Configuration ---
 config = DEFAULT_CONFIG
 config.set_as_global()
 
 
 # --- Betaflight Binary Path ---
-BETAFLIGHT_PATH = Path(__file__).parent / "betaflight" / "obj" / "main" / "betaflight_SITL.elf"
+# Points to the top-level betaflight fork (skypulse branch), not a submodule
+BETAFLIGHT_DIR = Path(__file__).parent.parent.parent.parent / "betaflight"
+BETAFLIGHT_PATH = BETAFLIGHT_DIR / "obj" / "main" / "betaflight_SITL.elf"
 
 if not BETAFLIGHT_PATH.exists():
     print(f"ERROR: Betaflight SITL not found at {BETAFLIGHT_PATH}")
-    print("Run ./build.sh in examples/betaflight-sitl to build it")
+    print("Run './run.sh build-bf' from the elodin directory to build it")
     sys.exit(1)
 
 
@@ -98,12 +152,30 @@ drone = world.spawn(
     name="drone",
 )
 
+# Static ground marker at origin — gives the camera a fixed orbit target
+ground = world.spawn(
+    [
+        el.Body(
+            world_pos=el.SpatialTransform(
+                linear=jnp.array([0.0, 0.0, 0.0]),
+                angular=el.Quaternion(jnp.array([0.0, 0.0, 0.0, 1.0])),
+            ),
+            world_vel=el.SpatialMotion(
+                linear=jnp.array([0.0, 0.0, 0.0]),
+                angular=jnp.array([0.0, 0.0, 0.0]),
+            ),
+            inertia=el.SpatialInertia(mass=0.001, inertia=jnp.array([0.001, 0.001, 0.001])),
+        ),
+    ],
+    name="ground",
+)
+
 # Editor schematic for visualization
 world.schematic(
     """
     tabs {
         hsplit name = "Viewport" {
-            viewport name=Viewport pos="drone.world_pos + (0,0,0,0, 10,10,5)" look_at="drone.world_pos" show_grid=#true active=#true
+            viewport name=Viewport pos="drone.world_pos.translate_world(5.0, 5.0, 3.0)" look_at="drone.world_pos" show_grid=#true active=#true
             vsplit share=0.3 {
                 graph "drone.motor_command" name="Motor Commands (from Betaflight)"
                 graph "drone.motor_thrust" name="Motor Thrust"
@@ -136,7 +208,7 @@ system = physics | sensors
 betaflight_recipe = el.s10.PyRecipe.process(
     name="Betaflight SITL",
     cmd=str(BETAFLIGHT_PATH),
-    cwd=str(Path(__file__).parent),
+    cwd=str(BETAFLIGHT_DIR),
 )
 world.recipe(betaflight_recipe)
 
@@ -171,7 +243,8 @@ THROTTLE_DUR = 10.0  # Apply throttle (longer for observation)
 # Remaining time is disarm phase
 
 # Calculate max ticks for completion detection
-MAX_TICKS = int(config.simulation_time / config.sim_time_step)
+# In joystick mode, no auto-completion (1 hour); scripted mode uses config duration
+MAX_TICKS = int(3600 / config.sim_time_step) if _js_connected[0] else int(config.simulation_time / config.sim_time_step)
 
 # Shared state (using lists for mutable closure)
 bridge = [None]
@@ -268,31 +341,36 @@ def sitl_post_step(tick: int, ctx: el.StepContext):
             print(f"[SITL] Warning: Could not read sensor data: {e}")
         buf.timestamp = t
 
-    # Phase logic - determine arm and throttle based on sim time
-    if t < BOOTGRACE:
-        phase = "boot"
-        s.arm = 1000  # Disarmed
-        s.throttle = 1000  # Min throttle
-    elif t < BOOTGRACE + ARM_DUR:
-        phase = "arm"
-        s.arm = 1800  # Armed (AUX1 high)
-        s.throttle = 1000  # Min throttle during arm
-    elif t < BOOTGRACE + ARM_DUR + THROTTLE_DUR:
-        phase = "throttle"
-        s.arm = 1800  # Stay armed
-        s.throttle = 1400  # Mid throttle
-    else:
-        phase = "disarm"
-        s.arm = 1000  # Disarm
-        s.throttle = 1000
-
-    # Build RC packet with all channels (reuse pre-allocated buffer)
+    # RC input: joystick if connected, otherwise scripted fallback
     channels = _rc_channels_buffer
-    channels[0] = 1500  # Roll (center)
-    channels[1] = 1500  # Pitch (center)
-    channels[2] = s.throttle  # Throttle
-    channels[3] = 1500  # Yaw (center)
-    channels[4] = s.arm  # AUX1 (arm switch)
+    if _js_connected[0]:
+        phase = "joystick"
+        channels[:] = _js_channels[:MAX_RC_CHANNELS]
+        s.throttle = channels[2]
+        s.arm = channels[4]
+    else:
+        # Scripted fallback when no joystick is connected
+        if t < BOOTGRACE:
+            phase = "boot"
+            s.arm = 1000
+            s.throttle = 1000
+        elif t < BOOTGRACE + ARM_DUR:
+            phase = "arm"
+            s.arm = 1800
+            s.throttle = 1000
+        elif t < BOOTGRACE + ARM_DUR + THROTTLE_DUR:
+            phase = "throttle"
+            s.arm = 1800
+            s.throttle = 1400
+        else:
+            phase = "disarm"
+            s.arm = 1000
+            s.throttle = 1000
+        channels[0] = 1500
+        channels[1] = 1500
+        channels[2] = s.throttle
+        channels[3] = 1500
+        channels[4] = s.arm
 
     # Build FDM packet with sensor data
     fdm = buf.build_fdm()
@@ -346,10 +424,11 @@ def sitl_post_step(tick: int, ctx: el.StepContext):
         except Exception as e:
             debug_str = f"\n    [DEBUG] read failed: {e}"
 
+        rc_str = f"T={channels[2]} R={channels[0]} P={channels[1]} Y={channels[3]} A={channels[4]}" if _js_connected[0] else ""
         print(
             f"  t={t:5.1f}s | {phase:8} | {armed:8} | "
             f"motors=[{s.motors[0]:.3f},{s.motors[1]:.3f},{s.motors[2]:.3f},{s.motors[3]:.3f}] | "
-            f"{pos_str} | {rate:.1f}x realtime{debug_str}"
+            f"{pos_str} | {rate:.1f}x{' | ' + rc_str if rc_str else ''}{debug_str}"
         )
         last_print[0] = t
 
@@ -423,14 +502,24 @@ def next_filename(pattern: str) -> str:
 #   elodin editor examples/betaflight-sitl/main.py
 
 db_filename = next_filename("betaflight_dbXXX")
+# With joystick: run interactively (no time limit, close editor to stop)
+# Without joystick: run for config.simulation_time seconds
+use_interactive = _js_connected[0]
+# 1 hour at 4kHz = 14.4M ticks; interactive=True lets editor control pause/resume
+max_ticks = int(3600 / config.sim_time_step) if use_interactive else int(config.simulation_time / config.sim_time_step)
+if use_interactive:
+    print("Joystick mode: fly with your TX12, close editor to stop")
+else:
+    print(f"Scripted mode: {config.simulation_time}s automated flight")
 world.run(
     system,
     sim_time_step=config.sim_time_step,
     run_time_step=config.sim_time_step,
-    max_ticks=int(config.simulation_time / config.sim_time_step),
+    max_ticks=max_ticks,
     post_step=sitl_post_step,
     db_path=db_filename,
-    interactive=False,
+    interactive=use_interactive,
+    backend="jax",
 )
 # `world.run()` won't reach here unless `interactive` is false.
 print(f"Wrote database to: {db_filename}")

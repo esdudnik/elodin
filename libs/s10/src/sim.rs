@@ -35,6 +35,9 @@ impl SimRecipe {
         if !cfg!(target_os = "linux") {
             cmd.process_group(0); // NOTE(sphw): this causes all sorts of issues on linux, not sure why
         }
+        // Detach stdin so the child doesn't receive SIGTTIN when in a
+        // background process group (process_group(0) above).
+        cmd.stdin(std::process::Stdio::null());
         let port = crate::liveness::serve_tokio().await?;
         let mut child = cmd
             .arg(&self.path)

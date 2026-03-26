@@ -2663,6 +2663,7 @@ async fn handle_real_time_stream_batched<A: AsyncWrite + 'static>(
 
             // Rebuild the VTable with the full component set.
             let vtable_msg = DBVisitor.vtable(&components)?;
+
             let id: PacketId = fastrand::u16(..).to_le_bytes();
             table = LenPacket::table(id, 2048 - 16);
             {
@@ -2823,16 +2824,14 @@ impl DBVisitor {
         let mut fields = vec![];
         let mut offset = 0;
         self.visit(components, |entity| {
-            if !entity.time_series.index().is_empty() {
-                offset += PrimType::U64.padding(offset);
-                let op = timestamp(builder::raw_table(offset as u16, 8), entity.as_vtable_op());
-                offset += size_of::<Timestamp>();
-                offset += entity.schema.prim_type.padding(offset);
-                let len = entity.schema.size();
-                let size = len as u16;
-                fields.push(raw_field(offset as u16, size, op));
-                offset += len;
-            }
+            offset += PrimType::U64.padding(offset);
+            let op = timestamp(builder::raw_table(offset as u16, 8), entity.as_vtable_op());
+            offset += size_of::<Timestamp>();
+            offset += entity.schema.prim_type.padding(offset);
+            let len = entity.schema.size();
+            let size = len as u16;
+            fields.push(raw_field(offset as u16, size, op));
+            offset += len;
             Ok(())
         })?;
         Ok(vtable(fields))
@@ -2852,11 +2851,6 @@ impl DBVisitor {
     ) -> Result<(), Error> {
         const YIELD_EVERY: usize = 8;
         for (i, (_, component)) in components.iter().enumerate() {
-            // Skip components with no data – the VTable builder
-            // (vtable()) excludes them, so we must too.
-            if component.time_series.index().is_empty() {
-                continue;
-            }
             let tick = component.time_series.start_timestamp().max(timestamp);
             match component.get_nearest(tick) {
                 Some((ts, buf)) => {
@@ -2892,11 +2886,6 @@ impl DBVisitor {
         table: &mut LenPacket,
     ) {
         for (_, component) in components.iter() {
-            // Skip components with no data – the VTable builder
-            // (vtable()) excludes them, so we must too.
-            if component.time_series.index().is_empty() {
-                continue;
-            }
             let elem_size = component.schema.size();
             let prim_type = component.schema.prim_type;
             match component.time_series.latest() {

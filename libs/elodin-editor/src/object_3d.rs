@@ -749,17 +749,62 @@ pub fn update_object_3d_system(
     mesh_child_markers: Query<(), With<Object3DMeshChild>>,
     entity_map: Res<EntityMap>,
     component_value_maps: Query<&'static ComponentValue>,
+    eql_ctx: Res<crate::EqlContext>,
 ) {
     for (entity, mut object_3d, mut pos, ellipse, has_received, children_maybe) in
         objects_query.iter_mut()
     {
-        if let Some(compiled_expr) = &object_3d.compiled_expr
-            && let Ok(component_value) = compiled_expr.execute(&entity_map, &component_value_maps)
-            && let Some(world_pos) = component_value.as_world_pos()
-        {
-            *pos = world_pos;
-            if !has_received {
-                commands.entity(entity).insert(WorldPosReceived);
+        // Retry EQL compilation if it failed during schematic load
+        // (EQL context may not have had component metadata yet)
+        if object_3d.compiled_expr.is_none() {
+            if let Ok(expr) = eql_ctx.0.parse_str(&object_3d.data.eql) {
+                warn!(
+                    ?entity,
+                    eql = %object_3d.data.eql,
+                    "object_3d: deferred EQL compilation succeeded"
+                );
+                object_3d.compiled_expr = Some(compile_eql_expr(expr));
+            } else {
+                warn_once!(
+                    ?entity,
+                    eql = %object_3d.data.eql,
+                    eql_components = ?eql_ctx.0.component_parts.keys().collect::<Vec<_>>(),
+                    "object_3d: EQL parse still failing, context components listed"
+                );
+            }
+        }
+
+        if let Some(compiled_expr) = &object_3d.compiled_expr {
+            match compiled_expr.execute(&entity_map, &component_value_maps) {
+                Ok(component_value) => {
+                    if let Some(world_pos) = component_value.as_world_pos() {
+                        warn_once!(
+                            ?entity,
+                            eql = %object_3d.data.eql,
+                            pos = ?world_pos.pos,
+                            "object_3d: FIRST WorldPos update"
+                        );
+                        *pos = world_pos;
+                        if !has_received {
+                            commands.entity(entity).insert(WorldPosReceived);
+                        }
+                    } else {
+                        warn!(
+                            ?entity,
+                            eql = %object_3d.data.eql,
+                            value = ?component_value,
+                            "object_3d: as_world_pos() returned None"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn_once!(
+                        ?entity,
+                        eql = %object_3d.data.eql,
+                        error = %err,
+                        "object_3d: EQL execute failed"
+                    );
+                }
             }
         }
 
@@ -1238,7 +1283,7 @@ impl ComponentArrayExt for ComponentValue {
 pub fn create_object_3d_entity(
     commands: &mut Commands,
     data: impeller2_wkt::Object3D,
-    expr: eql::Expr,
+    expr: Option<eql::Expr>,
     ctx: &eql::Context,
     material_assets: &mut ResMut<Assets<StandardMaterial>>,
     mesh_assets: &mut ResMut<Assets<Mesh>>,
@@ -1289,7 +1334,7 @@ pub fn create_object_3d_entity(
     let entity_id = commands
         .spawn((
             Object3DState {
-                compiled_expr: Some(compile_eql_expr(expr)),
+                compiled_expr: expr.map(compile_eql_expr),
                 scale_expr,
                 scale_error,
                 error_covariance_cholesky_expr,

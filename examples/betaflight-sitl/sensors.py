@@ -41,6 +41,7 @@ import numpy as np
 
 from config import DroneConfig
 from comms import FDMPacket
+from sim import MotorThrust
 
 
 class Noise:
@@ -93,8 +94,8 @@ class Noise:
 # Note: Betaflight's attitude estimator is sensitive to noise during the
 # bootgrace/calibration period. High noise causes attitude drift and
 # motor imbalance at liftoff.
-gyro_noise = Noise(0, 0, 0.01, 0.001)  # Gyro noise + bias drift
-accel_noise = Noise(0, 1, 0.01, 0.001)  # Accel noise (no drift)
+gyro_noise = Noise(0, 0, 1e-4, 1e-5)   # Gyro noise + bias drift (realistic BMI270 levels)
+accel_noise = Noise(0, 1, 1e-4, 1e-5)  # Accel noise + bias drift (realistic BMI270 levels)
 baro_noise = Noise(0, 2, 0.01, 0.001)  # ~0.03m std dev
 mag_noise = Noise(0, 3, 0.01, 0.001)  # Magnetometer noise (very low)
 
@@ -300,7 +301,7 @@ def create_accel_system(config: DroneConfig):
     the previous reading is held.
 
     Detects ground contact to correctly report +g when at rest (the ground
-    constraint zeros velocity but doesn't add normal force to the Force component).
+    spring-damper applies forces via velocity correction, not via the Force component).
     """
     gravity = config.gravity
     ground_level = config.ground_level
@@ -396,21 +397,39 @@ def create_body_vel_system(config: DroneConfig):
 
 def create_baro_system(config: DroneConfig):
     """
-    Create barometer sensor system with multi-rate support.
+    Create barometer sensor system with multi-rate support and ground effect.
 
     Simulates barometric altitude measurement based on height.
-    Applies noise when enabled (~0.3m std dev typical for consumer barometers).
+    Applies noise when enabled (~0.1m std dev).
 
-    Multi-rate: Updates at 480Hz (BMP581 continuous mode). Between updates,
+    Ground effect: when props are spinning near the ground, downwash bounces
+    off the surface and increases pressure at the baro sensor. This makes baro
+    read LOWER altitude than actual → ALT_HOLD over-thrusts → "fly to moon".
+
+    Multi-rate: Updates at configured baro_rate. Between updates,
     the previous reading is held.
     """
     tick_interval = config.baro_tick_interval
+    ge_height = config.ground_effect_height
+    ge_baro_bias = config.ground_effect_baro_bias
+    ground_level = config.ground_level
+    max_thrust = config.motor_max_thrust
 
-    def _compute_baro_reading(tick: jax.Array, pos: el.SpatialTransform) -> jax.Array:
-        """Internal: Compute fresh barometer reading."""
-        # Simple model: altitude = z position
+    def _compute_baro_reading(tick: jax.Array, pos: el.SpatialTransform,
+                               motor_thrust: jax.Array) -> jax.Array:
+        """Internal: Compute fresh barometer reading with ground effect bias."""
         altitude = pos.linear()[2]
         baro_reading = jnp.array([altitude])
+
+        # Ground effect baro bias: props blow air down → bounces off ground
+        # → higher pressure at sensor → baro reads lower altitude
+        # Scales with: proximity² (strongest at ground) × thrust fraction
+        agl = altitude - ground_level
+        proximity = jnp.clip((ge_height - agl) / ge_height, 0.0, 1.0)
+        total_thrust = jnp.sum(motor_thrust)
+        thrust_fraction = jnp.clip(total_thrust / (4.0 * max_thrust * 0.3), 0.0, 1.0)
+        bias = ge_baro_bias * proximity * proximity * thrust_fraction
+        baro_reading = baro_reading + bias
 
         # Add noise if enabled
         if config.sensor_noise:
@@ -423,14 +442,14 @@ def create_baro_system(config: DroneConfig):
         tick: SensorTick,
         pos: el.WorldPos,
         prev_baro: PrevBaro,
+        motor_thrust: MotorThrust,
     ) -> tuple[Baro, PrevBaro]:
         """
-        Compute barometer reading with multi-rate decimation.
+        Compute barometer reading with multi-rate decimation and ground effect.
 
-        Updates at baro_tick_interval (e.g., every 17 ticks for 480Hz at 8kHz PID).
-        Returns previous reading when not updating.
+        Updates at baro_tick_interval. Returns previous reading when not updating.
         """
-        new_reading = _compute_baro_reading(tick, pos)
+        new_reading = _compute_baro_reading(tick, pos, motor_thrust)
 
         # Update only on tick intervals; otherwise hold previous value
         baro_out = jax.lax.cond(
@@ -608,6 +627,7 @@ def build_fdm_from_components(
     gyro: np.ndarray,
     timestamp: float,
     gravity: float = 9.80665,
+    baro: np.ndarray = None,
 ) -> FDMPacket:
     """
     Build an FDM packet directly from Elodin component data.
@@ -633,9 +653,23 @@ def build_fdm_from_components(
     # Import here to avoid circular dependency
     from comms import FDMPacket
 
-    # Extract quaternion from Elodin format [qx, qy, qz, qw] and convert to [qw, qx, qy, qz]
+    # Extract quaternion from Elodin format [qx, qy, qz, qw]
     quat_xyzw = np.array(world_pos[:4])
-    quat = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])  # [w, x, y, z]
+    enu_x, enu_y, enu_z, enu_w = quat_xyzw[0], quat_xyzw[1], quat_xyzw[2], quat_xyzw[3]
+
+    # Convert quaternion from ENU/FLU to NED/FRD for Betaflight.
+    #
+    # q_NED = q_T_world * q_ENU * q_T_body  where:
+    #   q_T_world = [0, 1/√2, 1/√2, 0]  (180° around [1,1,0]/√2, ENU→NED)
+    #   q_T_body  = [0, 1, 0, 0]         (180° around X, FLU→FRD)
+    #
+    # Expanding the quaternion product symbolically gives:
+    s = 1.0 / np.sqrt(2.0)
+    ned_w = -s * (enu_w + enu_z)
+    ned_x = -s * (enu_x + enu_y)
+    ned_y = s * (enu_y - enu_x)
+    ned_z = s * (enu_z - enu_w)
+    quat = np.array([ned_w, ned_x, ned_y, ned_z])
 
     # Extract position [x, y, z] (ENU)
     position = np.array(world_pos[4:7])
@@ -660,13 +694,16 @@ def build_fdm_from_components(
     #   FRD_y = -FLU_y  (right = -left)
     #   FRD_z = -FLU_z  (down = -up)
     #
-    # Accelerometer: We want [FLU_x, -FLU_y, -FLU_z] after BF negates all.
-    #   Send [-FLU_x, FLU_y, FLU_z] → BF gets [FLU_x, -FLU_y, -FLU_z] ✓
+    # Accelerometer: BF expects accADC.z = +acc_1G at rest (gravity pointing down).
+    # BF SITL negates all accel axes: acc = -packet.  So we send pre-negated values.
+    # At rest in FLU: accel = [0, 0, +g].  We want BF to see [0, 0, +g] after negation.
+    #   Send [-FLU_x, FLU_y, -FLU_z] → BF gets [FLU_x, -FLU_y, FLU_z]
+    #   FRD result: [X_frd=+FLU_x, Y_frd=-FLU_y, Z_frd=+FLU_z(=+g at rest)] ✓
     accel_ned = np.array(
         [
             -accel_enu[0],  # BF: -(-X) = X
-            accel_enu[1],  # BF: -Y
-            accel_enu[2],  # BF: -Z
+            accel_enu[1],  # BF: -(Y) = -Y
+            -accel_enu[2],  # BF: -(-Z) = +Z  (at rest: +g, gravity down)
         ]
     )
 
@@ -682,8 +719,13 @@ def build_fdm_from_components(
         ]
     )
 
-    # Calculate pressure from altitude (simplified atmosphere model)
-    altitude = position[2]
+    # Calculate pressure from simulated baro (with noise + ground effect) if available,
+    # otherwise fall back to true altitude. Using simulated baro is required for
+    # realistic ALT_HOLD testing — true altitude bypasses the baro sensor model.
+    if baro is not None and len(baro) > 0:
+        altitude = float(baro[0])
+    else:
+        altitude = position[2]
     pressure = 101325.0 - 12.0 * altitude
 
     return FDMPacket(
@@ -779,6 +821,7 @@ class SensorDataBuffer:
             self.accel,
             self.gyro,
             self.timestamp,
+            baro=self.baro,
         )
 
 

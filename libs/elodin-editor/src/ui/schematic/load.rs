@@ -514,9 +514,11 @@ impl LoadSchematicParams<'_, '_> {
     }
 
     pub fn spawn_object_3d(&mut self, object_3d: Object3D) {
-        let Ok(expr) = self.eql.0.parse_str(&object_3d.eql) else {
-            return;
-        };
+        // Try to parse the EQL expression now, but don't bail if it fails.
+        // The EQL context may not have component metadata yet (race with DB).
+        // If parsing fails, create the entity with compiled_expr=None and let
+        // update_object_3d_system retry on subsequent frames.
+        let expr = self.eql.0.parse_str(&object_3d.eql).ok();
         let icon = object_3d.icon.clone();
         let mesh_vr = object_3d.mesh_visibility_range.clone();
         let entity = crate::object_3d::create_object_3d_entity(
