@@ -183,12 +183,15 @@ class DroneConfig:
     ground_level: float = 0.0
 
     # Ground effect / propwash parameters
-    # Props blow air down → bounces off ground → increases pressure at baro sensor
-    # → baro reads LOWER altitude → ALT_HOLD over-thrusts → "fly to moon" on takeoff
-    ground_effect_height: float = 0.50   # meters — effect zone AGL
-    ground_effect_baro_bias: float = 0.0   # DIAGNOSTIC: zeroed to isolate liftoff instability
-    ground_effect_force_std: float = 0.0   # DIAGNOSTIC: zeroed to isolate liftoff instability
-    ground_effect_torque_std: float = 0.0  # DIAGNOSTIC: zeroed to isolate liftoff instability
+    # Near ground with motors spinning, prop wash bounces off surface:
+    #   baro_bias (negative) → baro reads lower altitude → ALT_HOLD over-thrusts
+    #   force_std → turbulent force perturbation (N) in all axes
+    #   torque_std → turbulent torque perturbation (N·m) in all axes
+    # All scale with: proximity² × thrust_fraction, active within ground_effect_height AGL
+    ground_effect_height: float = 0.50    # meters — effect zone AGL
+    ground_effect_baro_bias: float = -0.20  # meters — negative = baro reads lower altitude near ground
+    ground_effect_force_std: float = 0.05   # Newtons — mild near-ground force disturbance
+    ground_effect_torque_std: float = 0.001 # N·m — mild near-ground torque disturbance
 
     # Ground contact model parameters (multi-point spring-damper)
     # Contact points are at motor XY positions but offset below body center
@@ -197,6 +200,7 @@ class DroneConfig:
     contact_stiffness: float = 800.0       # N/m per contact point (vertical spring)
     contact_damping: float = 15.0          # N/(m/s) per contact point (vertical damper)
     contact_friction: float = 0.0          # N/(m/s) lateral friction (zeroed for tuning)
+    contact_fade_threshold: float = 0.0015 # meters — smoothstep fade zone near separation (1.5mm)
 
     # --- Computed Properties ---
 

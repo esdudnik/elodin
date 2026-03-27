@@ -226,6 +226,7 @@ def create_apply_forces_system(config: DroneConfig):
     contact_k = config.contact_stiffness
     contact_c = config.contact_damping
     contact_fric = config.contact_friction
+    contact_fade = config.contact_fade_threshold  # smoothstep fade zone near separation
 
     @el.map
     def apply_forces(
@@ -279,18 +280,22 @@ def create_apply_forces_system(config: DroneConfig):
 
             # Penetration depth (positive when below ground)
             penetration = ground_level - pt_world[2]
-            in_contact = penetration > 0.0
+
+            # Graduated contact: smoothstep fade over contact_fade zone near separation
+            # Prevents abrupt force discontinuity that causes liftoff gyro spike
+            # smoothstep(x) = 3x² - 2x³ for x in [0,1]
+            fade_t = jnp.clip(penetration / contact_fade, 0.0, 1.0)
+            contact_fraction = fade_t * fade_t * (3.0 - 2.0 * fade_t)  # smoothstep
 
             # Normal force: spring + damper, clamped non-negative (unilateral)
             f_spring = contact_k * penetration
             f_damper = -contact_c * pt_vel[2]  # damp vertical velocity at point
             f_normal = jnp.maximum(f_spring + f_damper, 0.0)
-            f_normal = jnp.where(in_contact, f_normal, 0.0)
+            f_normal = f_normal * contact_fraction
 
             # Lateral friction: viscous damping of horizontal velocity at point
-            # Only when in contact
-            f_friction_x = jnp.where(in_contact, -contact_fric * pt_vel[0], 0.0)
-            f_friction_y = jnp.where(in_contact, -contact_fric * pt_vel[1], 0.0)
+            f_friction_x = -contact_fric * pt_vel[0] * contact_fraction
+            f_friction_y = -contact_fric * pt_vel[1] * contact_fraction
 
             # Total force at this contact point (world frame)
             pt_force_world = jnp.array([f_friction_x, f_friction_y, f_normal])

@@ -131,10 +131,12 @@ DISARM_DURATION = 1.0
 CLIMB_TIMEOUT = 90.0    # max time to reach target altitude
 DESCEND_TIMEOUT = 60.0  # max time to descend
 
-# Crash detection
+# Crash / runaway detection
 CRASH_MOTOR_ASYMMETRY = 0.7    # max - min motor difference threshold
 CRASH_GROUND_STUCK_TIME = 3.0  # seconds on ground with asymmetric motors = crash
 CRASH_MAX_VELOCITY = 8.0       # m/s — vertical speed indicating out of control
+ALTITUDE_CEILING = 50.0        # meters — absolute altitude limit, fail immediately if exceeded
+RUNAWAY_CLIMB_TIME = 2.0       # seconds — sustained positive vz during descent phases = runaway
 
 
 # ============================================================================
@@ -192,6 +194,7 @@ class TestState:
     crash_detected: bool = False
     crash_reason: str = ""
     ground_stuck_time: float = 0.0  # how long on ground with asymmetric motors
+    runaway_climb_time: float = 0.0  # how long vz has been positive during descent phases
 
     # Diagnostics
     last_print_time: float = -1.0
@@ -329,6 +332,34 @@ def check_crash(state: TestState, t: float, dt: float) -> bool:
             f"(limit: {CRASH_MAX_VELOCITY}m/s). Flight out of control."
         )
         return True
+
+    # Runaway: altitude ceiling exceeded
+    if state.current_altitude > ALTITUDE_CEILING:
+        state.crash_detected = True
+        state.crash_reason = (
+            f"Altitude ceiling exceeded: alt={state.current_altitude:.1f}m "
+            f"(limit: {ALTITUDE_CEILING}m). Runaway climb."
+        )
+        return True
+
+    # Runaway: sustained climb during descent phases
+    descent_phases = (Phase.DESCEND, Phase.APPROACH, Phase.LAND)
+    if state.phase in descent_phases:
+        if state.current_vz > 0.5:  # climbing at > 0.5 m/s during descent
+            state.runaway_climb_time += dt
+        else:
+            state.runaway_climb_time = 0.0
+
+        if state.runaway_climb_time >= RUNAWAY_CLIMB_TIME:
+            state.crash_detected = True
+            state.crash_reason = (
+                f"Runaway climb during {state.phase.name}: "
+                f"vz={state.current_vz:+.1f}m/s sustained for {state.runaway_climb_time:.1f}s. "
+                f"alt={state.current_altitude:.1f}m"
+            )
+            return True
+    else:
+        state.runaway_climb_time = 0.0
 
     return False
 
