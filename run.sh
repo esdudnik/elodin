@@ -17,6 +17,7 @@ cd "$REPO_ROOT"
 
 EXAMPLE="examples/betaflight-sitl/main.py"
 E2E_SCRIPT="$REPO_ROOT/e2e_althold_test.py"
+E2E_FLIGHT_SCRIPT="$REPO_ROOT/e2e_flight_test.py"
 BETAFLIGHT_DIR="$REPO_ROOT/../betaflight"
 LOG_FILE="/tmp/bf-elodin.log"
 E2E_LOG_FILE="/tmp/bf-e2e.log"
@@ -319,6 +320,12 @@ case "$MODE" in
     e2e-althold-editor)
         do_e2e editor
         ;;
+    e2e-flight)
+        E2E_SCRIPT="$E2E_FLIGHT_SCRIPT" do_e2e headless
+        ;;
+    e2e-flight-editor)
+        E2E_SCRIPT="$E2E_FLIGHT_SCRIPT" do_e2e editor
+        ;;
     check)
         do_check_logs
         ;;
@@ -329,6 +336,8 @@ case "$MODE" in
         echo "  run                   - run editor (skip rebuild)"
         echo "  e2e-althold           - run ALT_HOLD E2E test (headless)"
         echo "  e2e-althold-editor    - run ALT_HOLD E2E test (with 3D viewport)"
+        echo "  e2e-flight            - run horizontal flight E2E test (headless)"
+        echo "  e2e-flight-editor     - run horizontal flight E2E test (with 3D viewport)"
         echo "  all                   - build-bf + rebuild-elodin + run (default)"
         echo "  check                 - analyze log file at $LOG_FILE"
         exit 1

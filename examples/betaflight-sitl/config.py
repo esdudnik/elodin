@@ -190,7 +190,7 @@ class DroneConfig:
     # All scale with: proximity² × thrust_fraction, active within ground_effect_height AGL
     ground_effect_height: float = 0.50    # meters — effect zone AGL
     ground_effect_baro_bias: float = -0.20  # meters — negative = baro reads lower altitude near ground
-    ground_effect_force_std: float = 0.05   # Newtons — mild near-ground force disturbance
+    ground_effect_force_std: float = 0.05   # Newtons — near-ground force disturbance (limit for D=10/10)
     ground_effect_torque_std: float = 0.001 # N·m — mild near-ground torque disturbance
 
     # Ground contact model parameters (multi-point spring-damper)

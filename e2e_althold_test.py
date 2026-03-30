@@ -14,9 +14,10 @@ ALT_HOLD uses an iNav-style cascaded controller implemented in Betaflight:
                   -> [PT1 Filter] -> hover_throttle + correction -> motors
 
 Flight phases:
-  BOOT(5s) -> ARM(2s) -> ENABLE_ALTHOLD -> SETTLE(1s) -> CLIMB(to 6.5m)
-  -> TOP_APPROACH(slow climb to 7m) -> HOVER(10s) -> DESCEND(to 2m)
-  -> APPROACH(to 0.5m) -> LAND(contact-based) -> DISARM -> DONE
+  BOOT(5s) -> ARM(2s) -> ENABLE_ALTHOLD -> SETTLE(1s) -> CLIMB(to 5.5m)
+  -> TOP_APPROACH(slow climb to 6.8m) -> HOVER(10s) -> DESCEND(to 2m)
+  -> RAMP_APPROACH(throttle ramp 1380->1450, to 0.5m + 1s dwell)
+  -> LOW_HOVER(10s near ground) -> LAND(contact-based) -> DISARM -> DONE
 
 Landing uses contact-based disarm: altitude < 0.1m AND |vz| < 0.2m/s held for 0.5s.
 
@@ -75,7 +76,7 @@ if not BETAFLIGHT_PATH.exists():
 
 TARGET_ALTITUDE = 7.0        # meters — climb target
 HOVER_DURATION = 10.0        # seconds — hold at target altitude
-HOVER_TOLERANCE = 1.0        # meters — max acceptable drift during hover
+HOVER_TOLERANCE = 0.5        # meters — max acceptable drift during hover
 LAND_MAX_VELOCITY = 1.5      # m/s — max acceptable landing speed
 TEST_TIMEOUT = 200.0         # seconds — total simulation time limit
 
@@ -92,7 +93,19 @@ HOVER_TARGET_TOLERANCE = 2.0 # meters — hover target must be within this of TA
 APPROACH_ALTITUDE = 2.0      # meters — switch from coarse to gentle descent
 APPROACH_THROTTLE = 1380     # just below deadband — gentle ~0.25m/s descent
 APPROACH_TIMEOUT = 60.0      # seconds — max time in approach phase
-LAND_ENTRY_ALT = 0.5         # meters — switch from approach to landing
+
+# Ramp approach — altitude-based throttle ramp (iNav-style descent velocity ramping)
+# Throttle ramps linearly from APPROACH_THROTTLE at APPROACH_ALTITUDE to RAMP_THROTTLE_HIGH near ground
+RAMP_THROTTLE_HIGH = 1450    # throttle at low altitude (still below deadband 1450-1550)
+RAMP_APPROACH_TIMEOUT = 60.0 # seconds — max time in ramp approach
+
+# LOW_HOVER — near-ground hold
+LOW_HOVER_ENTRY_ALT = 0.5   # meters — max altitude to enter LOW_HOVER
+LOW_HOVER_ENTRY_VZ = 0.2    # m/s — max |vz| to enter LOW_HOVER
+LOW_HOVER_DWELL = 1.0       # seconds — conditions must hold before entry (estimator convergence)
+LOW_HOVER_DURATION = 10.0   # seconds — hold time near ground
+LOW_HOVER_TIMEOUT = 30.0    # seconds — max time waiting to enter LOW_HOVER
+LOW_HOVER_DRIFT_TOLERANCE = 0.5  # meters — max drift from capture altitude during LOW_HOVER
 
 # Contact-based landing
 GROUND_CONTACT_ALT = 0.10   # meters — max altitude for ground contact detection
@@ -153,11 +166,11 @@ class Phase(Enum):
     HOVER = auto()
     DESCEND = auto()         # coarse descent at ~1m/s (throttle 1300)
     APPROACH = auto()        # gentle descent at ~0.25m/s (throttle 1380)
+    RAMP_APPROACH = auto()   # altitude-based throttle ramp (1380→1450) — iNav-style descent velocity ramping
+    LOW_HOVER = auto()       # near-ground hold (~0.3-0.5m) — tests ground effect zone
     LAND = auto()            # gentle descent to touchdown + contact-based disarm
     DISARM = auto()
     DONE = auto()
-    # LOW_HOVER removed — ground effect is disabled, so near-ground hold is not meaningful yet.
-    # Will be re-added when ground effect is enabled (sim realism package).
 
 
 @dataclass
@@ -184,6 +197,9 @@ class TestState:
     hover_max_drift: float = 0.0
     hover_target: float = 0.0
     top_approach_dwell: float = 0.0  # how long vz has been below threshold in TOP_APPROACH
+    low_hover_dwell: float = 0.0     # how long conditions met for LOW_HOVER entry
+    low_hover_target: float = 0.0    # altitude at LOW_HOVER capture
+    low_hover_max_drift: float = 0.0 # max drift from capture during LOW_HOVER
 
     # Landing tracking
     land_altitude: float = 0.0
@@ -281,6 +297,25 @@ def build_rc_channels(state: TestState) -> np.ndarray:
         channels[CH_ALTHOLD] = MODE_ON
         channels[CH_THROTTLE] = APPROACH_THROTTLE  # just below deadband = gentle descent
 
+    elif phase == Phase.RAMP_APPROACH:
+        # Altitude-based throttle ramp: slower descent as altitude decreases (iNav-style)
+        channels[CH_ARM] = MODE_ON
+        channels[CH_ANGLE] = MODE_ON
+        channels[CH_ALTHOLD] = MODE_ON
+        # Linear ramp from APPROACH_THROTTLE at APPROACH_ALTITUDE to RAMP_THROTTLE_HIGH near ground
+        alt = max(state.current_altitude, 0.0)
+        progress = (APPROACH_ALTITUDE - alt) / (APPROACH_ALTITUDE - LOW_HOVER_ENTRY_ALT)
+        progress = max(0.0, min(1.0, progress))
+        throttle = int(APPROACH_THROTTLE + progress * (RAMP_THROTTLE_HIGH - APPROACH_THROTTLE))
+        channels[CH_THROTTLE] = throttle
+
+    elif phase == Phase.LOW_HOVER:
+        # Near-ground hold — stick centered to capture altitude
+        channels[CH_ARM] = MODE_ON
+        channels[CH_ANGLE] = MODE_ON
+        channels[CH_ALTHOLD] = MODE_ON
+        channels[CH_THROTTLE] = ALTHOLD_HOLD  # center = hold altitude
+
     elif phase == Phase.LAND:
         # Controlled landing: keep ALT_HOLD active with gentle descend.
         channels[CH_ARM] = MODE_ON
@@ -343,7 +378,7 @@ def check_crash(state: TestState, t: float, dt: float) -> bool:
         return True
 
     # Runaway: sustained climb during descent phases
-    descent_phases = (Phase.DESCEND, Phase.APPROACH, Phase.LAND)
+    descent_phases = (Phase.DESCEND, Phase.APPROACH, Phase.RAMP_APPROACH, Phase.LOW_HOVER, Phase.LAND)
     if state.phase in descent_phases:
         if state.current_vz > 0.5:  # climbing at > 0.5 m/s during descent
             state.runaway_climb_time += dt
@@ -464,29 +499,65 @@ def update_phase(state: TestState, t: float, dt: float = 0.001):
         if state.current_altitude <= APPROACH_ALTITUDE:
             print(
                 f"[{t:6.1f}s] [       DESCEND] "
-                f"Reached {APPROACH_ALTITUDE:.0f}m — switching to APPROACH"
+                f"Reached {APPROACH_ALTITUDE:.0f}m — switching to RAMP_APPROACH"
             )
-            state.transition(Phase.APPROACH, t)
+            state.transition(Phase.RAMP_APPROACH, t)
         elif elapsed >= DESCEND_TIMEOUT:
             print(
                 f"[{t:6.1f}s] [       DESCEND] "
                 f"TIMEOUT after {DESCEND_TIMEOUT:.0f}s: alt={state.current_altitude:.1f}m"
             )
-            state.transition(Phase.APPROACH, t)
+            state.transition(Phase.RAMP_APPROACH, t)
 
     elif phase == Phase.APPROACH:
-        # Transition to LAND — APPROACH uses gentle descent (1380), LAND continues
-        # with the same throttle but adds contact-based disarm detection.
-        if state.current_altitude <= LAND_ENTRY_ALT:
+        # APPROACH decelerates from ~1m/s to ~0.25m/s, then hands off to RAMP_APPROACH
+        if state.current_altitude <= APPROACH_ALTITUDE - 0.5:  # 1.5m
             print(
                 f"[{t:6.1f}s] [      APPROACH] "
-                f"Low altitude: alt={state.current_altitude:.2f}m vz={state.current_vz:.2f}m/s — switching to LAND"
+                f"Starting ramp: alt={state.current_altitude:.2f}m vz={state.current_vz:.2f}m/s — switching to RAMP_APPROACH"
             )
-            state.transition(Phase.LAND, t)
+            state.transition(Phase.RAMP_APPROACH, t)
         elif elapsed >= APPROACH_TIMEOUT:
             print(
                 f"[{t:6.1f}s] [      APPROACH] "
                 f"TIMEOUT after {APPROACH_TIMEOUT:.0f}s: alt={state.current_altitude:.1f}m vz={state.current_vz:.2f}m/s"
+            )
+            state.transition(Phase.RAMP_APPROACH, t)
+
+    elif phase == Phase.RAMP_APPROACH:
+        # Altitude-based throttle ramp — descent slows as altitude decreases
+        vz_abs = abs(state.current_vz)
+        if state.current_altitude <= LOW_HOVER_ENTRY_ALT and vz_abs < LOW_HOVER_ENTRY_VZ:
+            state.low_hover_dwell += dt
+        else:
+            state.low_hover_dwell = 0.0
+
+        if state.low_hover_dwell >= LOW_HOVER_DWELL:
+            print(
+                f"[{t:6.1f}s] [ RAMP_APPROACH] "
+                f"Low & slow for {state.low_hover_dwell:.1f}s: "
+                f"alt={state.current_altitude:.2f}m vz={state.current_vz:.2f}m/s — switching to LOW_HOVER"
+            )
+            state.transition(Phase.LOW_HOVER, t)
+        elif elapsed >= RAMP_APPROACH_TIMEOUT:
+            print(
+                f"[{t:6.1f}s] [ RAMP_APPROACH] "
+                f"TIMEOUT after {RAMP_APPROACH_TIMEOUT:.0f}s: alt={state.current_altitude:.1f}m vz={state.current_vz:.2f}m/s"
+            )
+            state.transition(Phase.LAND, t)
+
+    elif phase == Phase.LOW_HOVER:
+        # Track drift from capture altitude
+        if state.low_hover_target == 0.0:
+            state.low_hover_target = state.current_altitude  # capture on first tick
+        drift = abs(state.current_altitude - state.low_hover_target)
+        state.low_hover_max_drift = max(state.low_hover_max_drift, drift)
+
+        if elapsed >= LOW_HOVER_DURATION:
+            print(
+                f"[{t:6.1f}s] [     LOW_HOVER] "
+                f"Complete ({LOW_HOVER_DURATION:.0f}s). alt={state.current_altitude:.2f}m "
+                f"capture={state.low_hover_target:.2f}m drift={state.low_hover_max_drift:.2f}m"
             )
             state.transition(Phase.LAND, t)
 
@@ -591,6 +662,9 @@ def print_results(state: TestState):
     if state.hover_altitudes:
         avg = sum(state.hover_altitudes) / len(state.hover_altitudes)
         print(f"  Hover avg altitude:   {avg:.1f}m")
+    if state.low_hover_target > 0:
+        print(f"  Low hover capture:    {state.low_hover_target:.2f}m")
+        print(f"  Low hover max drift:  {state.low_hover_max_drift:.2f}m (tolerance: {LOW_HOVER_DRIFT_TOLERANCE}m)")
     print(f"  Landing altitude:     {state.land_altitude:.2f}m")
     print(f"  Landing velocity:     {state.land_velocity:.2f}m/s")
     if state.crash_detected:
@@ -624,6 +698,14 @@ def print_results(state: TestState):
         issues.append(
             f"Hover drift too large "
             f"({state.hover_max_drift:.1f}m > {HOVER_TOLERANCE}m)"
+        )
+
+    if state.low_hover_max_drift > LOW_HOVER_DRIFT_TOLERANCE:
+        passed = False
+        issues.append(
+            f"LOW_HOVER drift too large "
+            f"({state.low_hover_max_drift:.2f}m > {LOW_HOVER_DRIFT_TOLERANCE}m, "
+            f"capture={state.low_hover_target:.2f}m)"
         )
 
     if state.land_altitude > GROUND_CONTACT_ALT:
