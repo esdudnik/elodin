@@ -410,6 +410,10 @@ def create_baro_system(config: DroneConfig):
     the previous reading is held.
     """
     tick_interval = config.baro_tick_interval
+    baro_const_bias = config.baro_constant_bias
+    bias_delay = config.baro_bias_delay_s
+    bias_ramp = config.baro_bias_ramp_s
+    sim_dt = config.sim_time_step
     ge_height = config.ground_effect_height
     ge_baro_bias = config.ground_effect_baro_bias
     ground_level = config.ground_level
@@ -419,7 +423,12 @@ def create_baro_system(config: DroneConfig):
                                motor_thrust: jax.Array) -> jax.Array:
         """Internal: Compute fresh barometer reading with ground effect bias."""
         altitude = pos.linear()[2]
-        baro_reading = jnp.array([altitude])
+
+        # Time-delayed constant bias: ramps in linearly after bias_delay seconds
+        sim_time = tick * sim_dt
+        ramp_t = jnp.clip((sim_time - bias_delay) / jnp.maximum(bias_ramp, 1e-6), 0.0, 1.0)
+        effective_bias = baro_const_bias * ramp_t
+        baro_reading = jnp.array([altitude + effective_bias])
 
         # Ground effect baro bias: props blow air down → bounces off ground
         # → higher pressure at sensor → baro reads lower altitude

@@ -3,21 +3,27 @@ set -euo pipefail
 
 # ── Elodin + Betaflight build & run script ──
 # Run from the elodin repo root, inside `nix develop` shell.
-# Usage: ./run.sh [build-bf|rebuild-elodin|run|e2e-althold|e2e-althold-editor|all|check]
-#   build-bf              - clean + build betaflight SITL .elf
-#   rebuild-elodin        - rebuild elodin (Python SDK + editor binary)
-#   run                   - just run the editor (skip rebuild)
-#   e2e-althold           - run ALT_HOLD E2E test (headless)
-#   e2e-althold-editor    - run ALT_HOLD E2E test (with 3D viewport)
-#   all                   - build-bf + rebuild-elodin + run (default)
-#   check                 - analyze log file
+# Usage: ./run.sh [build-bf|rebuild-elodin|run|e2e-angle-althold|e2e-acro-althold|e2e-flight|all|check]
+#   build-bf                  - clean + build betaflight SITL .elf
+#   rebuild-elodin            - rebuild elodin (Python SDK + editor binary)
+#   run                       - just run the editor (skip rebuild)
+#   e2e-angle-althold         - run ANGLE+ALTHOLD E2E test (headless)
+#   e2e-angle-althold-editor  - run ANGLE+ALTHOLD E2E test (with 3D viewport)
+#   e2e-acro-althold          - run ACRO+ALTHOLD E2E test (headless)
+#   e2e-acro-althold-editor   - run ACRO+ALTHOLD E2E test (with 3D viewport)
+#   e2e-flight                - run horizontal flight E2E test (headless)
+#   e2e-flight-editor         - run horizontal flight E2E test (with 3D viewport)
+#   all                       - build-bf + rebuild-elodin + run (default)
+#   check                     - analyze log file
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_ROOT"
 
 EXAMPLE="examples/betaflight-sitl/main.py"
-E2E_SCRIPT="$REPO_ROOT/e2e_althold_test.py"
+E2E_SCRIPT="$REPO_ROOT/e2e_angle_althold_test.py"
+E2E_ACRO_SCRIPT="$REPO_ROOT/e2e_acro_althold_test.py"
 E2E_FLIGHT_SCRIPT="$REPO_ROOT/e2e_flight_test.py"
+E2E_FAILSAFE_SCRIPT="$REPO_ROOT/e2e_failsafe_althold_test.py"
 BETAFLIGHT_DIR="$REPO_ROOT/../betaflight"
 LOG_FILE="/tmp/bf-elodin.log"
 E2E_LOG_FILE="/tmp/bf-e2e.log"
@@ -314,11 +320,17 @@ case "$MODE" in
         do_rebuild
         do_run
         ;;
-    e2e-althold)
+    e2e-angle-althold)
         do_e2e headless
         ;;
-    e2e-althold-editor)
+    e2e-angle-althold-editor)
         do_e2e editor
+        ;;
+    e2e-acro-althold)
+        E2E_SCRIPT="$E2E_ACRO_SCRIPT" do_e2e headless
+        ;;
+    e2e-acro-althold-editor)
+        E2E_SCRIPT="$E2E_ACRO_SCRIPT" do_e2e editor
         ;;
     e2e-flight)
         E2E_SCRIPT="$E2E_FLIGHT_SCRIPT" do_e2e headless
@@ -326,18 +338,28 @@ case "$MODE" in
     e2e-flight-editor)
         E2E_SCRIPT="$E2E_FLIGHT_SCRIPT" do_e2e editor
         ;;
+    e2e-failsafe-althold)
+        E2E_SCRIPT="$E2E_FAILSAFE_SCRIPT" do_e2e headless
+        ;;
+    e2e-failsafe-althold-editor)
+        E2E_SCRIPT="$E2E_FAILSAFE_SCRIPT" do_e2e editor
+        ;;
     check)
         do_check_logs
         ;;
     *)
-        echo "Usage: ./run.sh [build-bf|rebuild-elodin|run|e2e-althold|e2e-althold-editor|all|check]"
-        echo "  build-bf              - clean + build betaflight SITL .elf"
-        echo "  rebuild-elodin        - rebuild elodin (Python SDK + editor binary)"
-        echo "  run                   - run editor (skip rebuild)"
-        echo "  e2e-althold           - run ALT_HOLD E2E test (headless)"
-        echo "  e2e-althold-editor    - run ALT_HOLD E2E test (with 3D viewport)"
-        echo "  e2e-flight            - run horizontal flight E2E test (headless)"
-        echo "  e2e-flight-editor     - run horizontal flight E2E test (with 3D viewport)"
+        echo "Usage: ./run.sh [build-bf|rebuild-elodin|run|e2e-angle-althold|e2e-acro-althold|e2e-flight|all|check]"
+        echo "  build-bf                  - clean + build betaflight SITL .elf"
+        echo "  rebuild-elodin            - rebuild elodin (Python SDK + editor binary)"
+        echo "  run                       - run editor (skip rebuild)"
+        echo "  e2e-angle-althold         - run ANGLE+ALTHOLD E2E test (headless)"
+        echo "  e2e-angle-althold-editor  - run ANGLE+ALTHOLD E2E test (with 3D viewport)"
+        echo "  e2e-acro-althold          - run ACRO+ALTHOLD E2E test (headless)"
+        echo "  e2e-acro-althold-editor   - run ACRO+ALTHOLD E2E test (with 3D viewport)"
+        echo "  e2e-flight                - run horizontal flight E2E test (headless)"
+        echo "  e2e-flight-editor         - run horizontal flight E2E test (with 3D viewport)"
+        echo "  e2e-failsafe-althold      - run failsafe landing E2E test (headless)"
+        echo "  e2e-failsafe-althold-editor - run failsafe landing E2E test (with 3D viewport)"
         echo "  all                   - build-bf + rebuild-elodin + run (default)"
         echo "  check                 - analyze log file at $LOG_FILE"
         exit 1

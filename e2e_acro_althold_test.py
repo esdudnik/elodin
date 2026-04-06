@@ -1,32 +1,26 @@
 #!/usr/bin/env python3
 """
-E2E ALT_HOLD Test: Takeoff, climb to 7m, hover, descend, and land.
+E2E ACRO+ALTHOLD Test: ALTHOLD without ANGLE mode (ACRO attitude + auto altitude).
 
-Tests Betaflight's ALT_HOLD flight mode end-to-end:
-- Betaflight SITL runs the full flight controller (PID loops, motor mixing, altitude hold)
-- Elodin runs the physics simulation (rigid body, motors, sensors, ground constraint)
-- Communication via UDP lockstep (FDM sensor packets + motor commands at 1kHz)
-
-ALT_HOLD uses an iNav-style cascaded controller implemented in Betaflight:
-  Altitude error -> [Sqrt Controller] -> Target velocity
-                  -> [Acceleration Limiter (0.5G up, 0.8G down)]
-                  -> [Velocity PID with anti-windup]
-                  -> [PT1 Filter] -> hover_throttle + correction -> motors
+Tests Betaflight's ALT_HOLD with ACRO attitude mode (no self-leveling):
+- Only ALTHOLD switch is set BEFORE arming — ANGLE is OFF
+- Drone flies in ACRO mode (rate-based attitude, no self-leveling)
+- ALTHOLD controls altitude automatically via barometer
+- Tests that altitude and attitude layers are truly independent
+- Without self-leveling, small attitude errors accumulate — wider tolerances expected
 
 Flight phases:
-  BOOT(5s) -> ARM(2s) -> ENABLE_ALTHOLD -> SETTLE(1s) -> CLIMB(to 5.5m)
+  BOOT(5s) -> PRESELECT(ALTHOLD on, ANGLE off, ARM off, 2s)
+  -> ARM(2s) -> SETTLE(1s) -> CLIMB(to 5.5m)
   -> TOP_APPROACH(slow climb to 6.8m) -> HOVER(10s) -> DESCEND(to 2m)
   -> RAMP_APPROACH(throttle ramp 1380->1450, to 0.5m + 1s dwell)
   -> LOW_HOVER(10s near ground) -> LAND(contact-based) -> DISARM -> DONE
 
 Landing uses contact-based disarm: altitude < 0.1m AND |vz| < 0.2m/s held for 0.5s.
 
-The test script only sets RC stick positions and AUX channel switches.
-Betaflight controls throttle internally via its altitude PID controller.
-
 Run:
-    cd elodin && ./run.sh e2e            # headless (recommended)
-    cd elodin && ./run.sh e2e-editor     # with 3D viewport
+    cd elodin && ./run.sh e2e-acro-althold          # headless (recommended)
+    cd elodin && ./run.sh e2e-acro-althold-editor   # with 3D viewport
 
 Prerequisites:
     1. Build Betaflight SITL: cd betaflight && make TARGET=SITL DEBUG=GDB
@@ -76,7 +70,7 @@ if not BETAFLIGHT_PATH.exists():
 
 TARGET_ALTITUDE = 7.0        # meters — climb target
 HOVER_DURATION = 10.0        # seconds — hold at target altitude
-HOVER_TOLERANCE = 0.5        # meters — max acceptable drift during hover
+HOVER_TOLERANCE = 1.0        # meters — wider for ACRO (no self-leveling, more drift expected)
 LAND_MAX_VELOCITY = 1.5      # m/s — max acceptable landing speed
 TEST_TIMEOUT = 200.0         # seconds — total simulation time limit
 
@@ -105,12 +99,11 @@ LOW_HOVER_ENTRY_VZ = 0.2    # m/s — max |vz| to enter LOW_HOVER
 LOW_HOVER_DWELL = 1.0       # seconds — conditions must hold before entry (estimator convergence)
 LOW_HOVER_DURATION = 10.0   # seconds — hold time near ground
 LOW_HOVER_TIMEOUT = 30.0    # seconds — max time waiting to enter LOW_HOVER
-LOW_HOVER_DRIFT_TOLERANCE = 0.5  # meters — max drift from capture altitude during LOW_HOVER
+LOW_HOVER_DRIFT_TOLERANCE = 1.0  # meters — wider for ACRO (no self-leveling)
 
-# Contact-based landing
-GROUND_CONTACT_ALT = 0.10   # meters — max altitude for ground contact detection
-GROUND_CONTACT_VZ = 0.2     # m/s — max |vz| for ground contact detection
-GROUND_CONTACT_HOLD = 0.5   # seconds — how long contact must be held before disarm
+# BF auto-disarm detection (Phase 3: BF owns landing)
+BF_DISARM_MOTOR_THRESHOLD = 0.01  # all motors must be below this
+BF_DISARM_DWELL = 0.3             # seconds — motors must stay zero for this long
 
 # RC channel indices (AETR + AUX)
 CH_ROLL = 0
@@ -158,8 +151,8 @@ RUNAWAY_CLIMB_TIME = 2.0       # seconds — sustained positive vz during descen
 
 class Phase(Enum):
     BOOT = auto()
-    ARM = auto()
-    ENABLE_ALTHOLD = auto()  # throttle LOW — triggers takeoff prep
+    PRESELECT = auto()       # ANGLE+ALTHOLD switches on, ARM off — switch preselection only
+    ARM = auto()             # ARM on — ALTHOLD activates on first armed tick, takeoff prep triggers
     SETTLE = auto()          # throttle CENTER — enables stick adjustment
     CLIMB = auto()
     TOP_APPROACH = auto()    # slow climb (throttle 1630) — lets estimator converge before hover
@@ -205,6 +198,7 @@ class TestState:
     land_altitude: float = 0.0
     land_velocity: float = 0.0
     ground_contact_time: float = 0.0  # how long on_ground conditions have been met
+    bf_disarm_dwell: float = 0.0      # how long BF motors have been zero while ARM is still commanded
 
     # Crash detection
     crash_detected: bool = False
@@ -243,66 +237,56 @@ def build_rc_channels(state: TestState) -> np.ndarray:
     if phase == Phase.BOOT:
         pass  # everything off
 
-    elif phase == Phase.ARM:
-        channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
+    elif phase == Phase.PRESELECT:
+        # Switch preselection: ALTHOLD on, ANGLE off, ARM off.
+        # ACRO is default attitude mode (no self-leveling).
+        # BF sees switch states but ALT_HOLD_MODE does not activate (gated by ARMED).
+        channels[CH_ALTHOLD] = MODE_ON
+        # CH_ANGLE stays MODE_OFF — ACRO attitude
         channels[CH_THROTTLE] = RC_LOW
 
-    elif phase == Phase.ENABLE_ALTHOLD:
-        # Enable ALT_HOLD with LOW throttle so BF's takeoff prep triggers:
-        # lastThrottle < LOW_THROTTLE_THRESHOLD → preloads integrator negative
-        # → motors stay at idle until CLIMB phase raises stick
+    elif phase == Phase.ARM:
+        # ARM on — ALTHOLD activates on first armed tick.
+        # Low throttle + near ground → takeoff prep triggers here.
+        # ANGLE stays off — drone is in ACRO mode.
         channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = RC_LOW  # triggers takeoff prep
+        channels[CH_THROTTLE] = RC_LOW
 
     elif phase == Phase.SETTLE:
         # Center throttle to enable BF's allowStickAdjustment flag.
-        # BF requires stick to pass through center before accepting climb/descend.
         channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_HOLD  # 1500 = center
+        channels[CH_THROTTLE] = ALTHOLD_HOLD
 
     elif phase == Phase.CLIMB:
         channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_CLIMB  # above 60% = climb
+        channels[CH_THROTTLE] = ALTHOLD_CLIMB
 
     elif phase == Phase.TOP_APPROACH:
-        # Slow climb above deadband — lets BF estimator converge before hover capture
         channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = TOP_APPROACH_THROTTLE  # above deadband, slow climb
+        channels[CH_THROTTLE] = TOP_APPROACH_THROTTLE
 
     elif phase == Phase.HOVER:
         channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_HOLD  # center = hold
+        channels[CH_THROTTLE] = ALTHOLD_HOLD
 
     elif phase == Phase.DESCEND:
         channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_DESCEND  # below 40% = coarse descent
+        channels[CH_THROTTLE] = ALTHOLD_DESCEND
 
     elif phase == Phase.APPROACH:
-        # Gentle descent to let BF estimator converge before landing
         channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = APPROACH_THROTTLE  # just below deadband = gentle descent
+        channels[CH_THROTTLE] = APPROACH_THROTTLE
 
     elif phase == Phase.RAMP_APPROACH:
-        # Altitude-based throttle ramp: slower descent as altitude decreases (iNav-style)
         channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        # Linear ramp from APPROACH_THROTTLE at APPROACH_ALTITUDE to RAMP_THROTTLE_HIGH near ground
         alt = max(state.current_altitude, 0.0)
         progress = (APPROACH_ALTITUDE - alt) / (APPROACH_ALTITUDE - LOW_HOVER_ENTRY_ALT)
         progress = max(0.0, min(1.0, progress))
@@ -310,18 +294,14 @@ def build_rc_channels(state: TestState) -> np.ndarray:
         channels[CH_THROTTLE] = throttle
 
     elif phase == Phase.LOW_HOVER:
-        # Near-ground hold — stick centered to capture altitude
         channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_HOLD  # center = hold altitude
+        channels[CH_THROTTLE] = ALTHOLD_HOLD
 
     elif phase == Phase.LAND:
-        # Controlled landing: keep ALT_HOLD active with gentle descend.
         channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = APPROACH_THROTTLE  # gentle descent to touchdown
+        channels[CH_THROTTLE] = APPROACH_THROTTLE
 
     elif phase == Phase.DISARM:
         channels[CH_THROTTLE] = RC_LOW
@@ -334,7 +314,7 @@ def build_rc_channels(state: TestState) -> np.ndarray:
 
 def check_crash(state: TestState, t: float, dt: float) -> bool:
     """Detect crash conditions. Returns True if crash detected."""
-    if state.phase in (Phase.BOOT, Phase.ARM, Phase.ENABLE_ALTHOLD, Phase.SETTLE, Phase.DISARM, Phase.DONE):
+    if state.phase in (Phase.BOOT, Phase.PRESELECT, Phase.ARM, Phase.SETTLE, Phase.DISARM, Phase.DONE):
         return False
 
     motors = state.motors
@@ -418,17 +398,21 @@ def update_phase(state: TestState, t: float, dt: float = 0.001):
     if phase == Phase.BOOT:
         if elapsed >= BOOT_DURATION:
             state.initial_altitude = state.current_altitude
+            state.transition(Phase.PRESELECT, t)
+
+    elif phase == Phase.PRESELECT:
+        if elapsed >= ALTHOLD_SETTLE:
+            print(
+                f"[{t:6.1f}s] [     PRESELECT] "
+                f"Switches set (ALTHOLD only, ACRO attitude). Arming..."
+            )
             state.transition(Phase.ARM, t)
 
     elif phase == Phase.ARM:
         if elapsed >= ARM_DURATION:
-            state.transition(Phase.ENABLE_ALTHOLD, t)
-
-    elif phase == Phase.ENABLE_ALTHOLD:
-        if elapsed >= ALTHOLD_SETTLE:
             print(
-                f"[{t:6.1f}s] [  ENABLE_ALTHOLD] "
-                f"ALT_HOLD engaged. Reference altitude: {state.current_altitude:.1f}m"
+                f"[{t:6.1f}s] [           ARM] "
+                f"Armed. ALTHOLD active. Reference altitude: {state.current_altitude:.1f}m"
             )
             state.transition(Phase.SETTLE, t)
 
@@ -562,24 +546,31 @@ def update_phase(state: TestState, t: float, dt: float = 0.001):
             state.transition(Phase.LAND, t)
 
     elif phase == Phase.LAND:
-        # Contact-based disarm: altitude low + velocity low, held for GROUND_CONTACT_HOLD
-        if state.current_altitude < GROUND_CONTACT_ALT and abs(state.current_vz) < GROUND_CONTACT_VZ:
-            state.ground_contact_time += dt
+        # BF auto-disarm detection: ARM stays commanded, wait for BF to drop motors.
+        all_motors_zero = all(m < BF_DISARM_MOTOR_THRESHOLD for m in state.motors)
+        if all_motors_zero:
+            state.bf_disarm_dwell += dt
         else:
-            state.ground_contact_time = 0.0
+            state.bf_disarm_dwell = 0.0
 
-        if state.ground_contact_time >= GROUND_CONTACT_HOLD:
+        if state.bf_disarm_dwell >= BF_DISARM_DWELL:
             state.land_altitude = state.current_altitude
             state.land_velocity = abs(state.current_vz)
             print(
                 f"[{t:6.1f}s] [          LAND] "
-                f"Ground contact confirmed: alt={state.current_altitude:.2f}m vz={state.current_vz:.2f}m/s "
-                f"(held {state.ground_contact_time:.1f}s)"
+                f"BF auto-disarm detected: alt={state.current_altitude:.2f}m vz={state.current_vz:.2f}m/s "
+                f"motors=0 for {state.bf_disarm_dwell:.1f}s (ARM still commanded)"
             )
             state.transition(Phase.DISARM, t)
         elif elapsed >= LAND_TIMEOUT:
             state.land_altitude = state.current_altitude
             state.land_velocity = abs(state.current_vz)
+            print(
+                f"[{t:6.1f}s] [          LAND] "
+                f"FAIL: BF auto-disarm not observed after {LAND_TIMEOUT:.0f}s. "
+                f"alt={state.current_altitude:.2f}m vz={state.current_vz:.2f}m/s "
+                f"motors={[f'{m:.3f}' for m in state.motors]}"
+            )
             state.transition(Phase.DISARM, t)
 
     elif phase == Phase.DISARM:
@@ -649,7 +640,7 @@ def print_results(state: TestState):
     """Print final test results."""
     print()
     print("=" * 70)
-    print("  E2E ALT_HOLD TEST RESULTS")
+    print("  E2E ACRO+ALTHOLD TEST RESULTS")
     print("=" * 70)
     print(f"  Duration:             {state.sim_time:.1f}s")
     print(f"  Lockstep steps:       {state.step_count}")
@@ -708,11 +699,11 @@ def print_results(state: TestState):
             f"capture={state.low_hover_target:.2f}m)"
         )
 
-    if state.land_altitude > GROUND_CONTACT_ALT:
+    if state.land_altitude > 0.20:
         passed = False
         issues.append(
             f"Did not land properly "
-            f"({state.land_altitude:.2f}m > {GROUND_CONTACT_ALT}m)"
+            f"({state.land_altitude:.2f}m > 0.20m)"
         )
 
     if state.land_velocity > LAND_MAX_VELOCITY:
@@ -866,10 +857,10 @@ def e2e_post_step(tick: int, ctx: el.StepContext):
 
             print()
             print("=" * 70)
-            print("  E2E ALT_HOLD Test")
-            print(f"  Scenario: takeoff, climb to {TARGET_ALTITUDE}m, "
+            print("  E2E ACRO+ALTHOLD Test (no self-leveling)")
+            print(f"  Scenario: preselect ALTHOLD (no ANGLE), arm, climb to {TARGET_ALTITUDE}m, "
                   f"hover {HOVER_DURATION}s, descend, land")
-            print(f"  Config: {config.mass}kg quad, ANGLE + ALT_HOLD mode")
+            print(f"  Config: {config.mass}kg quad, ACRO + ALT_HOLD")
             print(f"  Controller: iNav-style cascaded (sqrt + velocity PID)")
             print(f"  Timeout: {TEST_TIMEOUT}s")
             print("=" * 70)
@@ -1012,12 +1003,12 @@ running_under_editor = "--liveness-port" in sys.argv
 #   After script exits, s10 watch loop just waits for file events (no restart
 #   since db is in /tmp/ and no other files change in the elodin directory)
 if running_under_editor:
-    db_path = "/tmp/e2e_test_db"
+    db_path = "/tmp/e2e_acro_althold_db"
 else:
-    db_path = "e2e_test_db"
+    db_path = "e2e_acro_althold_db"
 use_interactive = False
 
-print(f"E2E ALT_HOLD Test")
+print(f"E2E ACRO+ALTHOLD Test (no self-leveling)")
 print(f"  SITL binary: {BETAFLIGHT_PATH.name}")
 print(f"  Sim rate: {1.0/config.sim_time_step:.0f}Hz, timeout: {TEST_TIMEOUT}s")
 print(f"  Scenario: takeoff -> climb to {TARGET_ALTITUDE}m -> hover {HOVER_DURATION}s -> descend -> land")

@@ -182,6 +182,14 @@ class DroneConfig:
     # Ground level in meters
     ground_level: float = 0.0
 
+    # Constant baro bias (meters) — applied at all altitudes, independent of ground effect.
+    # Positive = baro reads higher altitude than truth. Negative = lower.
+    # GPS stays clean (truth altitude). Use for estimator disagreement testing.
+    # Bias activates after baro_bias_delay_s with a linear ramp of baro_bias_ramp_s.
+    baro_constant_bias: float = 0.0
+    baro_bias_delay_s: float = 15.0       # seconds — bias starts after this sim time (after arm + baro zero)
+    baro_bias_ramp_s: float = 1.0         # seconds — linear ramp from 0 to full bias
+
     # Ground effect / propwash parameters
     # Near ground with motors spinning, prop wash bounces off surface:
     #   baro_bias (negative) → baro reads lower altitude → ALT_HOLD over-thrusts

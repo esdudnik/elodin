@@ -53,5 +53,6 @@ testvids/
 
 # Compiled native libraries (macOS/Linux)
 *.dylib
-e2e_flight_db/
-e2e_test_db/
+e2e_*_db/
+e2e_*_db
+betaflight_db*/
