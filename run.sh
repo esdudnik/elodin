@@ -24,6 +24,9 @@ E2E_SCRIPT="$REPO_ROOT/e2e_angle_althold_test.py"
 E2E_ACRO_SCRIPT="$REPO_ROOT/e2e_acro_althold_test.py"
 E2E_FLIGHT_SCRIPT="$REPO_ROOT/e2e_flight_test.py"
 E2E_FAILSAFE_SCRIPT="$REPO_ROOT/e2e_failsafe_althold_test.py"
+E2E_POSHOLD_SCRIPT="$REPO_ROOT/e2e_poshold_test.py"
+E2E_NOSETTLE_SCRIPT="$REPO_ROOT/e2e_nosettle_takeoff_test.py"
+E2E_FAILSAFE_INIT_SCRIPT="$REPO_ROOT/e2e_failsafe_initialize_test.py"
 BETAFLIGHT_DIR="$REPO_ROOT/../betaflight"
 LOG_FILE="/tmp/bf-elodin.log"
 E2E_LOG_FILE="/tmp/bf-e2e.log"
@@ -344,6 +347,18 @@ case "$MODE" in
     e2e-failsafe-althold-editor)
         E2E_SCRIPT="$E2E_FAILSAFE_SCRIPT" do_e2e editor
         ;;
+    e2e-poshold)
+        E2E_SCRIPT="$E2E_POSHOLD_SCRIPT" do_e2e headless
+        ;;
+    e2e-poshold-editor)
+        E2E_SCRIPT="$E2E_POSHOLD_SCRIPT" do_e2e editor
+        ;;
+    e2e-nosettle-takeoff)
+        E2E_SCRIPT="$E2E_NOSETTLE_SCRIPT" do_e2e headless
+        ;;
+    e2e-failsafe-init)
+        E2E_SCRIPT="$E2E_FAILSAFE_INIT_SCRIPT" do_e2e headless
+        ;;
     check)
         do_check_logs
         ;;
@@ -360,6 +375,8 @@ case "$MODE" in
         echo "  e2e-flight-editor         - run horizontal flight E2E test (with 3D viewport)"
         echo "  e2e-failsafe-althold      - run failsafe landing E2E test (headless)"
         echo "  e2e-failsafe-althold-editor - run failsafe landing E2E test (with 3D viewport)"
+        echo "  e2e-poshold               - run POSHOLD E2E test (headless)"
+        echo "  e2e-poshold-editor        - run POSHOLD E2E test (with 3D viewport)"
         echo "  all                   - build-bf + rebuild-elodin + run (default)"
         echo "  check                 - analyze log file at $LOG_FILE"
         exit 1
