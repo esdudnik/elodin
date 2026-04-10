@@ -27,6 +27,7 @@ E2E_FAILSAFE_SCRIPT="$REPO_ROOT/e2e_failsafe_althold_test.py"
 E2E_POSHOLD_SCRIPT="$REPO_ROOT/e2e_poshold_test.py"
 E2E_NOSETTLE_SCRIPT="$REPO_ROOT/e2e_nosettle_takeoff_test.py"
 E2E_FAILSAFE_INIT_SCRIPT="$REPO_ROOT/e2e_failsafe_initialize_test.py"
+E2E_GROUND_IDLE_SCRIPT="$REPO_ROOT/e2e_ground_idle_test.py"
 BETAFLIGHT_DIR="$REPO_ROOT/../betaflight"
 LOG_FILE="/tmp/bf-elodin.log"
 E2E_LOG_FILE="/tmp/bf-e2e.log"
@@ -358,6 +359,9 @@ case "$MODE" in
         ;;
     e2e-failsafe-init)
         E2E_SCRIPT="$E2E_FAILSAFE_INIT_SCRIPT" do_e2e headless
+        ;;
+    e2e-ground-idle)
+        E2E_SCRIPT="$E2E_GROUND_IDLE_SCRIPT" do_e2e headless
         ;;
     check)
         do_check_logs

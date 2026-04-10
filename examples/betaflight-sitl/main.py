@@ -426,8 +426,15 @@ def sitl_post_step(tick: int, ctx: el.StepContext):
         except Exception as e:
             debug_str = f"\n    [DEBUG] read failed: {e}"
 
-        rc_str = (f"T={channels[2]} R={channels[0]} P={channels[1]} Y={channels[3]} "
-                  f"A1={channels[4]} A2={channels[5]} A3={channels[6]} A4={channels[7]}") if _js_connected[0] else ""
+        if _js_connected[0]:
+            arm = "ON" if channels[4] > 1700 else "off"
+            ang = "ON" if channels[5] > 1700 else "off"
+            alt = "ON" if channels[6] > 1700 else "off"
+            fs  = "ON" if channels[7] > 1700 else "off"
+            rc_str = (f"T={channels[2]} R={channels[0]} P={channels[1]} Y={channels[3]} "
+                      f"ARM={arm} ANG={ang} ALT={alt} FS={fs}")
+        else:
+            rc_str = ""
         print(
             f"  t={t:5.1f}s | {phase:8} | {armed:8} | "
             f"motors=[{s.motors[0]:.3f},{s.motors[1]:.3f},{s.motors[2]:.3f},{s.motors[3]:.3f}] | "
