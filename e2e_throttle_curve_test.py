@@ -1,26 +1,48 @@
 #!/usr/bin/env python3
 """
-E2E No-Settle Takeoff Regression Test.
+E2E Throttle Curve Test — validates curve-aware center-stick semantics.
 
-Validates that ALTHOLD takeoff works WITHOUT a center-throttle settle phase.
-This is a regression test for the allowStickAdjustment gate bug where
-preselecting ALTHOLD before arming, then raising throttle directly to climb,
-would be blocked because the stick never passed through the deadband.
+MANUAL TEST — not in automation gate. Requires custom EEPROM configuration.
+
+Validates that the curve-aware rcLookupThrottleMid() produces the correct
+zero point even with non-default throttle curve settings. With default
+linear curve, a wrong implementation could still pass.
+
+Prerequisites — MUST configure EEPROM before running:
+    # Connect to SITL CLI:
+    socat PTY,link=/tmp/bf-cli,rawer TCP:127.0.0.1:5761 &
+    screen /tmp/bf-cli
+    # Type '#' + Enter, then:
+    set thr_mid = 30
+    set thr_expo = 40
+    save
+
+    # After test, RESTORE defaults:
+    set thr_mid = 50
+    set thr_expo = 0
+    save
+
+Also requires standard ALTHOLD eeprom config (aux, failsafe, etc.).
+Assumes default midrc = 1500 and deadband = 50.
 
 Flight phases:
-  BOOT(5s) → PRESELECT(ANGLE+ALTHOLD on, ARM off, 2s) → ARM(2s)
-  → CLIMB(directly, NO settle phase) → TOP_APPROACH(to 6.8m) → HOVER(5s)
-  → GROUND_SAFETY(throttle LOW on ground, 3s — must NOT lift off or auto-disarm)
-  → DESCEND → LAND(BF auto-disarm) → DISARM → DONE
+  BOOT(5s) → PRESELECT(2s) → ARM(throttle LOW, 2s)
+  → BELOW_MID(midrc-300=1200, 5s — must NOT climb)
+  → CLIMB(midrc+200=1700, wait alt > 2m)
+  → HOLD(midrc=1500, 5s — drift < 1.0m)
+  → DISARM → DONE
 
-Also validates ground safety: armed at low throttle on ground must not
-spontaneously lift off or auto-disarm.
+Pass criteria:
+  - BELOW_MID: z < 0.1m (no liftoff)
+  - CLIMB: alt > 2m within 30s
+  - HOLD: drift < 1.0m from capture altitude
 
-Run:
-    cd elodin && ./run.sh e2e-nosettle-takeoff
-
-Prerequisites:
-    Same eeprom as other ALT_HOLD tests.
+How to run (manual, NOT via run.sh):
+    # 1. Configure EEPROM with thr_mid=30, thr_expo=40 (see above)
+    # 2. Start SITL: cd betaflight && ./obj/main/betaflight_SITL.elf
+    # 3. Run test:
+    cd elodin && python3 e2e_throttle_curve_test.py run --no-s10
+    # 4. Restore EEPROM: set thr_mid=50, thr_expo=0, save
 """
 
 import os
@@ -33,7 +55,6 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 
-# --- Path Setup ---
 SCRIPT_DIR = Path(__file__).resolve().parent
 SITL_EXAMPLE_DIR = SCRIPT_DIR / "examples" / "betaflight-sitl"
 sys.path.insert(0, str(SITL_EXAMPLE_DIR))
@@ -44,7 +65,6 @@ from config import DEFAULT_CONFIG
 from sensors import IMU, SensorDataBuffer, create_sensor_system
 from sim import Drone, create_physics_system
 
-# --- Betaflight Binary ---
 BETAFLIGHT_DIR = SCRIPT_DIR.parent / "betaflight"
 BETAFLIGHT_PATH = BETAFLIGHT_DIR / "obj" / "main" / "betaflight_SITL.elf"
 
@@ -57,29 +77,23 @@ if not BETAFLIGHT_PATH.exists():
 #  TEST PARAMETERS
 # ============================================================================
 
-TARGET_ALTITUDE = 7.0
-HOVER_DURATION = 5.0
-HOVER_TOLERANCE = 0.5
-TEST_TIMEOUT = 120.0
+MIDRC = 1500
+DEADBAND = 50
 
-TOP_APPROACH_ALTITUDE = 5.5
-TOP_APPROACH_THROTTLE = 1570
-TOP_APPROACH_VZ = 0.2
-TOP_APPROACH_MIN_ALT = 6.8
-TOP_APPROACH_DWELL = 0.5
-TOP_APPROACH_TIMEOUT = 30.0
+STICK_BELOW_MID = MIDRC - 300     # 1200
+STICK_CLIMB = MIDRC + 200         # 1700
+STICK_HOLD = MIDRC                # 1500
 
-# Ground safety: stay armed at low throttle, must not lift off or auto-disarm
-GROUND_SAFETY_DURATION = 3.0
-GROUND_SAFETY_MAX_ALT = 0.2  # meters — must stay below this
+BELOW_MID_DURATION = 5.0
+CLIMB_TIMEOUT = 30.0
+CLIMB_TARGET_ALT = 2.0
+HOLD_DURATION = 5.0
 
-CLIMB_TIMEOUT = 30.0  # shorter timeout — if it doesn't climb in 30s, the fix didn't work
-BF_DISARM_MOTOR_THRESHOLD = 0.01
-BF_DISARM_DWELL = 0.3
-LAND_TIMEOUT = 15.0
-DISARM_DURATION = 1.0
+GROUND_MAX_ALT = 0.1
+HOLD_MAX_DRIFT = 1.0
 
-# RC channels
+TEST_TIMEOUT = 90.0
+
 CH_ROLL = 0
 CH_PITCH = 1
 CH_THROTTLE = 2
@@ -92,15 +106,11 @@ RC_CENTER = 1500
 RC_LOW = 1000
 MODE_ON = 1800
 MODE_OFF = 1000
-ALTHOLD_CLIMB = 1700
-ALTHOLD_HOLD = 1500
-ALTHOLD_DESCEND = 1300
 
 BOOT_DURATION = 5.0
 ARM_DURATION = 2.0
 ALTHOLD_SETTLE = 2.0
-
-ALTITUDE_CEILING = 50.0
+DISARM_DURATION = 1.0
 
 
 # ============================================================================
@@ -111,12 +121,9 @@ class Phase(Enum):
     BOOT = auto()
     PRESELECT = auto()
     ARM = auto()
-    # NO SETTLE PHASE — this is the point of the test
+    BELOW_MID = auto()
     CLIMB = auto()
-    TOP_APPROACH = auto()
-    HOVER = auto()
-    DESCEND = auto()
-    LAND = auto()
+    HOLD = auto()
     DISARM = auto()
     DONE = auto()
 
@@ -134,29 +141,16 @@ class TestState:
 
     current_altitude: float = 0.0
     current_vz: float = 0.0
-    max_altitude: float = 0.0
-    baro_altitude: float = 0.0
 
-    hover_altitudes: list = field(default_factory=list)
-    hover_max_drift: float = 0.0
-    hover_target: float = 0.0
-    top_approach_dwell: float = 0.0
-
-    # Key metric: did it actually climb?
-    reached_climb: bool = False
-    climb_start_time: float = 0.0
-
-    land_altitude: float = 0.0
-    land_velocity: float = 0.0
-    bf_disarm_dwell: float = 0.0
+    max_alt_below_mid: float = 0.0
+    hold_capture_alt: float = 0.0
+    hold_max_drift: float = 0.0
 
     crash_detected: bool = False
     crash_reason: str = ""
 
     last_print_time: float = -1.0
     results_printed: bool = False
-    quat_xyzw: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0, 1.0]))
-    gyro_body: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
     def transition(self, new_phase: Phase, t: float):
         old = self.phase.name
@@ -181,10 +175,7 @@ def build_rc_channels(state: TestState) -> np.ndarray:
 
     phase = state.phase
 
-    if phase == Phase.BOOT:
-        pass
-
-    elif phase == Phase.PRESELECT:
+    if phase == Phase.PRESELECT:
         channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
         channels[CH_THROTTLE] = RC_LOW
@@ -195,36 +186,23 @@ def build_rc_channels(state: TestState) -> np.ndarray:
         channels[CH_ALTHOLD] = MODE_ON
         channels[CH_THROTTLE] = RC_LOW
 
-    # NO SETTLE — go directly to CLIMB from ARM
+    elif phase == Phase.BELOW_MID:
+        channels[CH_ARM] = MODE_ON
+        channels[CH_ANGLE] = MODE_ON
+        channels[CH_ALTHOLD] = MODE_ON
+        channels[CH_THROTTLE] = STICK_BELOW_MID
+
     elif phase == Phase.CLIMB:
         channels[CH_ARM] = MODE_ON
         channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_CLIMB
+        channels[CH_THROTTLE] = STICK_CLIMB
 
-    elif phase == Phase.TOP_APPROACH:
+    elif phase == Phase.HOLD:
         channels[CH_ARM] = MODE_ON
         channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = TOP_APPROACH_THROTTLE
-
-    elif phase == Phase.HOVER:
-        channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
-        channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_HOLD
-
-    elif phase == Phase.DESCEND:
-        channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
-        channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_DESCEND
-
-    elif phase == Phase.LAND:
-        channels[CH_ARM] = MODE_ON
-        channels[CH_ANGLE] = MODE_ON
-        channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_DESCEND
+        channels[CH_THROTTLE] = STICK_HOLD
 
     elif phase == Phase.DISARM:
         channels[CH_THROTTLE] = RC_LOW
@@ -240,98 +218,44 @@ def update_phase(state: TestState, t: float, dt: float):
     phase = state.phase
     elapsed = state.phase_elapsed(t)
 
-    if state.current_altitude > ALTITUDE_CEILING:
-        state.crash_detected = True
-        state.crash_reason = f"Altitude ceiling exceeded ({state.current_altitude:.1f}m)"
-        state.transition(Phase.DISARM, t)
-        return
-
     if phase == Phase.BOOT:
         if elapsed >= BOOT_DURATION:
             state.transition(Phase.PRESELECT, t)
 
     elif phase == Phase.PRESELECT:
         if elapsed >= ALTHOLD_SETTLE:
-            print(f"[{t:6.1f}s] [     PRESELECT] Switches set (ANGLE+ALTHOLD). Arming...")
             state.transition(Phase.ARM, t)
 
     elif phase == Phase.ARM:
         if elapsed >= ARM_DURATION:
-            print(
-                f"[{t:6.1f}s] [           ARM] "
-                f"Armed. Going DIRECTLY to CLIMB (no settle phase)."
-            )
-            state.climb_start_time = t
+            print(f"[{t:6.1f}s] [           ARM] Testing below-mid with non-default curve ({STICK_BELOW_MID})...")
+            state.transition(Phase.BELOW_MID, t)
+
+    elif phase == Phase.BELOW_MID:
+        state.max_alt_below_mid = max(state.max_alt_below_mid, state.current_altitude)
+        if state.current_altitude > GROUND_MAX_ALT:
+            state.crash_detected = True
+            state.crash_reason = f"Liftoff during BELOW_MID with custom curve (alt={state.current_altitude:.3f}m)"
+            state.transition(Phase.DISARM, t)
+            return
+        if elapsed >= BELOW_MID_DURATION:
+            print(f"[{t:6.1f}s] [     BELOW_MID] OK. Climbing ({STICK_CLIMB})...")
             state.transition(Phase.CLIMB, t)
 
     elif phase == Phase.CLIMB:
-        # Key test: does the drone actually climb without a settle phase?
-        if state.current_altitude > 1.0 and not state.reached_climb:
-            state.reached_climb = True
-            print(
-                f"[{t:6.1f}s] [         CLIMB] "
-                f"Climb confirmed! alt={state.current_altitude:.1f}m "
-                f"(took {t - state.climb_start_time:.1f}s from ARM)"
-            )
-
-        if state.current_altitude >= TOP_APPROACH_ALTITUDE:
-            state.transition(Phase.TOP_APPROACH, t)
+        if state.current_altitude > CLIMB_TARGET_ALT:
+            state.hold_capture_alt = state.current_altitude
+            print(f"[{t:6.1f}s] [         CLIMB] Reached {state.current_altitude:.1f}m. Hold check...")
+            state.transition(Phase.HOLD, t)
         elif elapsed >= CLIMB_TIMEOUT:
-            print(
-                f"[{t:6.1f}s] [         CLIMB] "
-                f"FAIL: Did not climb after {CLIMB_TIMEOUT:.0f}s. "
-                f"alt={state.current_altitude:.2f}m (allowStickAdjustment bug?)"
-            )
+            state.crash_detected = True
+            state.crash_reason = f"CLIMB timeout with custom curve: alt={state.current_altitude:.3f}m < {CLIMB_TARGET_ALT}m"
             state.transition(Phase.DISARM, t)
 
-    elif phase == Phase.TOP_APPROACH:
-        if state.current_altitude >= TOP_APPROACH_MIN_ALT:
-            if abs(state.current_vz) < TOP_APPROACH_VZ:
-                state.top_approach_dwell += dt
-            else:
-                state.top_approach_dwell = 0.0
-            if state.top_approach_dwell >= TOP_APPROACH_DWELL:
-                state.hover_target = state.current_altitude
-                state.transition(Phase.HOVER, t)
-        elif elapsed >= 30.0:
-            state.hover_target = state.current_altitude
-            state.transition(Phase.HOVER, t)
-
-    elif phase == Phase.HOVER:
-        drift = abs(state.current_altitude - state.hover_target)
-        state.hover_max_drift = max(state.hover_max_drift, drift)
-        state.hover_altitudes.append(state.current_altitude)
-        if elapsed >= HOVER_DURATION:
-            print(
-                f"[{t:6.1f}s] [         HOVER] "
-                f"Complete. drift={state.hover_max_drift:.1f}m. Descending..."
-            )
-            state.transition(Phase.DESCEND, t)
-
-    elif phase == Phase.DESCEND:
-        if state.current_altitude < 0.5:
-            state.transition(Phase.LAND, t)
-        elif elapsed >= 60.0:
-            state.transition(Phase.LAND, t)
-
-    elif phase == Phase.LAND:
-        all_motors_zero = all(m < BF_DISARM_MOTOR_THRESHOLD for m in state.motors)
-        if all_motors_zero:
-            state.bf_disarm_dwell += dt
-        else:
-            state.bf_disarm_dwell = 0.0
-        if state.bf_disarm_dwell >= BF_DISARM_DWELL:
-            state.land_altitude = state.current_altitude
-            state.land_velocity = abs(state.current_vz)
-            print(
-                f"[{t:6.1f}s] [          LAND] "
-                f"BF auto-disarm detected: alt={state.current_altitude:.2f}m"
-            )
-            state.transition(Phase.DISARM, t)
-        elif elapsed >= LAND_TIMEOUT:
-            state.land_altitude = state.current_altitude
-            state.land_velocity = abs(state.current_vz)
-            print(f"[{t:6.1f}s] [          LAND] FAIL: BF auto-disarm not observed")
+    elif phase == Phase.HOLD:
+        drift = abs(state.current_altitude - state.hold_capture_alt)
+        state.hold_max_drift = max(state.hold_max_drift, drift)
+        if elapsed >= HOLD_DURATION:
             state.transition(Phase.DISARM, t)
 
     elif phase == Phase.DISARM:
@@ -350,25 +274,12 @@ def print_status(state: TestState, t: float):
 
     motors_str = ",".join(f"{m:.3f}" for m in state.motors)
     channels = build_rc_channels(state)
-    throttle = channels[CH_THROTTLE]
-
-    if throttle <= 1050:
-        stick = "IDLE"
-    elif throttle >= 1650:
-        stick = "CLIMB"
-    elif throttle <= 1350:
-        stick = "DESCEND"
-    else:
-        stick = "HOLD"
-
-    arm = "ARM" if channels[CH_ARM] == MODE_ON else "---"
-    ang = "ANG" if channels[CH_ANGLE] == MODE_ON else "---"
-    alt = "ALT" if channels[CH_ALTHOLD] == MODE_ON else "---"
+    thr = channels[CH_THROTTLE]
 
     print(
         f"[{t:6.1f}s] [{state.phase.name:>14}] "
-        f"alt={state.current_altitude:+7.2f}m vz={state.current_vz:+5.2f}m/s "
-        f"motors=[{motors_str}] T={throttle} ({stick}) modes=[{arm}|{ang}|{alt}]"
+        f"alt={state.current_altitude:+7.3f}m vz={state.current_vz:+5.2f}m/s "
+        f"T={thr} motors=[{motors_str}]"
     )
 
 
@@ -379,17 +290,15 @@ def print_results(state: TestState):
 
     print()
     print("=" * 70)
-    print("  E2E NO-SETTLE TAKEOFF TEST RESULTS")
+    print("  E2E THROTTLE CURVE TEST RESULTS (manual, non-default curve)")
+    print("  NOTE: thr_mid=30, thr_expo=40 must be set in EEPROM before running")
     print("=" * 70)
     print(f"  Duration:             {state.sim_time:.1f}s")
     print(f"  Lockstep steps:       {state.step_count}")
     print()
-    print(f"  --- No-Settle Takeoff ---")
-    print(f"  Climb without settle: {'Yes' if state.reached_climb else 'No (BUG)'}")
-    print(f"  Max altitude:         {state.max_altitude:.1f}m")
-    print(f"  Hover target:         {state.hover_target:.1f}m")
-    print(f"  Hover max drift:      {state.hover_max_drift:.1f}m (tolerance: {HOVER_TOLERANCE}m)")
-    print(f"  Landing altitude:     {state.land_altitude:.2f}m")
+    print(f"  BELOW_MID max alt:    {state.max_alt_below_mid:.3f}m (limit={GROUND_MAX_ALT}m)")
+    print(f"  Hold capture alt:     {state.hold_capture_alt:.1f}m")
+    print(f"  Hold max drift:       {state.hold_max_drift:.2f}m (limit={HOLD_MAX_DRIFT}m)")
     if state.crash_detected:
         print(f"  Crash:                {state.crash_reason}")
     print()
@@ -397,33 +306,30 @@ def print_results(state: TestState):
     passed = True
     issues = []
 
-    if not state.reached_climb:
-        passed = False
-        issues.append("Did not climb without settle phase (allowStickAdjustment gate bug)")
-
     if state.crash_detected:
         passed = False
         issues.append(f"CRASH: {state.crash_reason}")
 
-    if state.hover_max_drift > HOVER_TOLERANCE:
+    if state.max_alt_below_mid > GROUND_MAX_ALT:
         passed = False
-        issues.append(f"Hover drift too large ({state.hover_max_drift:.1f}m)")
+        issues.append(f"BELOW_MID liftoff with custom curve: {state.max_alt_below_mid:.3f}m > {GROUND_MAX_ALT}m")
 
-    if state.land_altitude > 0.20:
+    if state.hold_max_drift > HOLD_MAX_DRIFT:
         passed = False
-        issues.append(f"Did not land properly ({state.land_altitude:.2f}m)")
+        issues.append(f"Hold drift with custom curve: {state.hold_max_drift:.2f}m > {HOLD_MAX_DRIFT}m")
 
     if state.step_count == 0:
         passed = False
         issues.append("No motor responses")
 
-    if passed:
-        print("  Status:               PASS")
-    else:
-        print("  Status:               FAIL")
-        for issue in issues:
-            print(f"    FAIL: {issue}")
-
+    print(f"  Status:               {'PASS' if passed else 'FAIL'}")
+    for issue in issues:
+        print(f"    {'FAIL' if not passed else 'INFO'}: {issue}")
+    print()
+    print("  REMINDER: Restore EEPROM after test:")
+    print("    set thr_mid = 50")
+    print("    set thr_expo = 0")
+    print("    save")
     print("=" * 70)
 
 
@@ -488,7 +394,7 @@ ground = world.spawn(
 world.schematic(
     """
     tabs {
-        hsplit name = "No-Settle Takeoff Test" {
+        hsplit name = "Throttle Curve Test" {
             viewport name=Viewport pos="drone.world_pos.translate_world(5.0, 5.0, 3.0)" look_at="drone.world_pos" show_grid=#true active=#true
             vsplit share=0.3 {
                 graph "drone.motor_command" name="Motor Commands"
@@ -500,7 +406,7 @@ world.schematic(
         glb path="edu-450-v2-drone.glb" rotate="(0.0, 0.0, 0.0)" translate="(0.0, 1.0, 0.0)" scale=10.0
     }
     """,
-    "e2e-nosettle-takeoff-test.kdl",
+    "e2e-throttle-curve-test.kdl",
 )
 
 physics = create_physics_system(config)
@@ -536,8 +442,8 @@ def e2e_post_step(tick: int, ctx: el.StepContext):
 
             print()
             print("=" * 70)
-            print("  E2E NO-SETTLE TAKEOFF Test (regression for allowStickAdjustment)")
-            print(f"  Scenario: PRESELECT → ARM → CLIMB directly (no settle)")
+            print("  E2E THROTTLE CURVE Test (manual, non-default curve)")
+            print(f"  Requires EEPROM: thr_mid=30, thr_expo=40")
             print(f"  Timeout: {TEST_TIMEOUT}s")
             print("=" * 70)
             print()
@@ -602,10 +508,6 @@ def e2e_post_step(tick: int, ctx: el.StepContext):
 
         s.current_altitude = float(world_pos[6]) if len(world_pos) > 6 else float(world_pos[2])
         s.current_vz = float(world_vel[5]) if len(world_vel) > 5 else float(world_vel[2])
-        s.max_altitude = max(s.max_altitude, s.current_altitude)
-        s.baro_altitude = float(baro[0]) if len(baro) > 0 else s.current_altitude
-        s.quat_xyzw = world_pos[:4]
-        s.gyro_body = gyro
     except RuntimeError as e:
         if tick > 5:
             print(f"[{t:6.1f}s] WARNING: {e}")
@@ -637,8 +539,6 @@ def e2e_post_step(tick: int, ctx: el.StepContext):
 
     if tick >= max_ticks - 1 and not s.results_printed:
         print(f"\n[{t:6.1f}s] TEST TIMEOUT")
-        s.land_altitude = s.current_altitude
-        s.land_velocity = abs(s.current_vz)
         b.stop()
         print_results(s)
 
@@ -648,11 +548,11 @@ def e2e_post_step(tick: int, ctx: el.StepContext):
 # ============================================================================
 
 running_under_editor = "--liveness-port" in sys.argv
-db_path = "/tmp/e2e_nosettle_test_db" if running_under_editor else "e2e_nosettle_test_db"
+db_path = "/tmp/e2e_throttle_curve_test_db" if running_under_editor else "e2e_throttle_curve_test_db"
 
-print(f"E2E NO-SETTLE TAKEOFF Test")
+print(f"E2E THROTTLE CURVE Test (manual)")
 print(f"  SITL: {BETAFLIGHT_PATH.name}")
-print(f"  Scenario: PRESELECT → ARM → CLIMB (no settle)")
+print(f"  Requires: thr_mid=30, thr_expo=40 in EEPROM")
 
 world.run(
     system,

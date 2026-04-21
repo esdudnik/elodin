@@ -80,7 +80,7 @@ TEST_TIMEOUT = 200.0         # seconds — total simulation time limit
 
 # Top approach — slow climb before hover to let BF estimator converge
 TOP_APPROACH_ALTITUDE = 5.5  # meters — switch from fast climb to slow climb (early entry for convergence)
-TOP_APPROACH_THROTTLE = 1600 # above deadband (1550) — slow climb, keeps isAdjustingAltitude=true
+TOP_APPROACH_THROTTLE = 1570 # just above deadband — slow climb (~10cm/s), keeps isAdjustingAltitude=true
 TOP_APPROACH_VZ = 0.2        # m/s — max |vz| to enter HOVER
 TOP_APPROACH_MIN_ALT = 6.8   # meters — minimum altitude to enter HOVER (one-sided gate)
 TOP_APPROACH_DWELL = 0.5     # seconds — vz must stay below threshold for this long before HOVER entry

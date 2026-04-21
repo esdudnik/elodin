@@ -28,6 +28,9 @@ E2E_POSHOLD_SCRIPT="$REPO_ROOT/e2e_poshold_test.py"
 E2E_NOSETTLE_SCRIPT="$REPO_ROOT/e2e_nosettle_takeoff_test.py"
 E2E_FAILSAFE_INIT_SCRIPT="$REPO_ROOT/e2e_failsafe_initialize_test.py"
 E2E_GROUND_IDLE_SCRIPT="$REPO_ROOT/e2e_ground_idle_test.py"
+E2E_CENTER_SCRIPT="$REPO_ROOT/e2e_center_semantics_test.py"
+E2E_MIDAIR_SCRIPT="$REPO_ROOT/e2e_midair_activation_test.py"
+E2E_SMOOTH_TAKEOFF_SCRIPT="$REPO_ROOT/e2e_smooth_takeoff_test.py"
 BETAFLIGHT_DIR="$REPO_ROOT/../betaflight"
 LOG_FILE="/tmp/bf-elodin.log"
 E2E_LOG_FILE="/tmp/bf-e2e.log"
@@ -363,6 +366,15 @@ case "$MODE" in
     e2e-ground-idle)
         E2E_SCRIPT="$E2E_GROUND_IDLE_SCRIPT" do_e2e headless
         ;;
+    e2e-center-semantics)
+        E2E_SCRIPT="$E2E_CENTER_SCRIPT" do_e2e headless
+        ;;
+    e2e-midair-activation)
+        E2E_SCRIPT="$E2E_MIDAIR_SCRIPT" do_e2e headless
+        ;;
+    e2e-smooth-takeoff)
+        E2E_SCRIPT="$E2E_SMOOTH_TAKEOFF_SCRIPT" do_e2e headless
+        ;;
     check)
         do_check_logs
         ;;
@@ -381,6 +393,9 @@ case "$MODE" in
         echo "  e2e-failsafe-althold-editor - run failsafe landing E2E test (with 3D viewport)"
         echo "  e2e-poshold               - run POSHOLD E2E test (headless)"
         echo "  e2e-poshold-editor        - run POSHOLD E2E test (with 3D viewport)"
+        echo "  e2e-center-semantics      - run center-stick semantics E2E test (headless)"
+        echo "  e2e-midair-activation     - run mid-air ALTHOLD activation E2E test (headless)"
+        echo "  e2e-smooth-takeoff        - run smooth takeoff ramp E2E test (headless)"
         echo "  all                   - build-bf + rebuild-elodin + run (default)"
         echo "  check                 - analyze log file at $LOG_FILE"
         exit 1

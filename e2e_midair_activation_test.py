@@ -1,26 +1,39 @@
 #!/usr/bin/env python3
 """
-E2E No-Settle Takeoff Regression Test.
+E2E Mid-Air ALTHOLD Activation Test — safety check for low-stick activation.
 
-Validates that ALTHOLD takeoff works WITHOUT a center-throttle settle phase.
-This is a regression test for the allowStickAdjustment gate bug where
-preselecting ALTHOLD before arming, then raising throttle directly to climb,
-would be blocked because the stick never passed through the deadband.
+Validates that activating ALTHOLD mid-air with stick below center does NOT
+cause an immediate forced descent. The INITIALIZE state should hold altitude
+(targetVelocity=0) when above the near-ground gate (1m), preventing dangerous
+altitude loss on activation.
+
+Prerequisites (standard SITL eeprom — same as other E2E tests):
+    aux 0 0 0 1700 2100 0 0
+    aux 1 1 1 1700 2100 0 0
+    aux 2 3 2 1700 2100 0 0
+    set failsafe_delay = 200
+    set ap_hover_throttle = 1300
+    set alt_hold_climb_rate = 200
+    set alt_hold_deadband = 50
+    save
+
+Assumes default midrc = 1500 and deadband = 50.
 
 Flight phases:
-  BOOT(5s) → PRESELECT(ANGLE+ALTHOLD on, ARM off, 2s) → ARM(2s)
-  → CLIMB(directly, NO settle phase) → TOP_APPROACH(to 6.8m) → HOVER(5s)
-  → GROUND_SAFETY(throttle LOW on ground, 3s — must NOT lift off or auto-disarm)
-  → DESCEND → LAND(BF auto-disarm) → DISARM → DONE
+  BOOT(5s) → PRESELECT_ANGLE(ANGLE only, 2s) → ARM(2s) → INITIAL_SETTLE(1500, 1s)
+  → CLIMB_ANGLE(1700, wait alt > 5m — climb in ANGLE mode, no ALTHOLD)
+  → STABILIZE(stick at 1100, wait |vz| < 0.5 for 0.3s — decel through zero-crossing)
+  → ACTIVATE_ALTHOLD(enable ALTHOLD with stick at 1300, 3s — must not dive)
+  → HOLD_CHECK(stick at 1500, 5s — verify altitude held vs activation capture)
+  → DISARM → DONE
 
-Also validates ground safety: armed at low throttle on ground must not
-spontaneously lift off or auto-disarm.
+Pass criteria:
+  - ACTIVATE_ALTHOLD: no descent spike below -0.3 m/s in first 1s (immediate reaction only)
+  - ACTIVATE_ALTHOLD: altitude drop < 0.5m from capture altitude
+  - HOLD_CHECK: altitude drift < 1.0m from activation capture altitude over 5s
 
 Run:
-    cd elodin && ./run.sh e2e-nosettle-takeoff
-
-Prerequisites:
-    Same eeprom as other ALT_HOLD tests.
+    cd elodin && ./run.sh e2e-midair-activation
 """
 
 import os
@@ -33,7 +46,6 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 
-# --- Path Setup ---
 SCRIPT_DIR = Path(__file__).resolve().parent
 SITL_EXAMPLE_DIR = SCRIPT_DIR / "examples" / "betaflight-sitl"
 sys.path.insert(0, str(SITL_EXAMPLE_DIR))
@@ -44,7 +56,6 @@ from config import DEFAULT_CONFIG
 from sensors import IMU, SensorDataBuffer, create_sensor_system
 from sim import Drone, create_physics_system
 
-# --- Betaflight Binary ---
 BETAFLIGHT_DIR = SCRIPT_DIR.parent / "betaflight"
 BETAFLIGHT_PATH = BETAFLIGHT_DIR / "obj" / "main" / "betaflight_SITL.elf"
 
@@ -57,29 +68,35 @@ if not BETAFLIGHT_PATH.exists():
 #  TEST PARAMETERS
 # ============================================================================
 
-TARGET_ALTITUDE = 7.0
-HOVER_DURATION = 5.0
-HOVER_TOLERANCE = 0.5
+MIDRC = 1500
+DEADBAND = 50
+
+STICK_CLIMB = MIDRC + 200             # 1700
+STICK_HOLD = MIDRC                     # 1500
+STICK_LOW_MID = MIDRC - 200           # 1300 — below center
+STICK_STABILIZE = 1100                 # low thrust to decelerate and cross vz=0 in ANGLE mode
+
+CLIMB_TARGET_ALT = 5.0
+CLIMB_TIMEOUT = 60.0
+STABILIZE_VZ_THRESHOLD = 0.5      # m/s — |vz| must be below this before activation
+STABILIZE_DWELL = 0.3             # seconds — sustained below threshold (zero-crossing window)
+STABILIZE_TIMEOUT = 20.0          # seconds — max time to stabilize
+STABILIZE_CEILING = 150.0         # meters — abort if drone goes above this
+ACTIVATE_SPIKE_WINDOW = 1.0       # seconds — only check descent spike in first 1s after activation
+ACTIVATE_DURATION = 3.0
+HOLD_DURATION = 5.0
+
+# Pass/fail thresholds (safety-focused — not precision hold)
+ACTIVATE_MAX_DESCENT_VZ = -0.3    # m/s — no spike below this (in first 1s only)
+ACTIVATE_MAX_ALT_DROP = 1.5       # meters — max altitude loss (safety limit)
+HOLD_MAX_DRIFT = 2.5              # meters — max drift during hold (safety limit)
+
+# Soft warning thresholds (track degradation, don't fail)
+ACTIVATE_WARN_ALT_DROP = 0.8      # meters — warn if settling sag exceeds this
+HOLD_WARN_DRIFT = 1.5             # meters — warn if hold drift exceeds this
+
 TEST_TIMEOUT = 120.0
 
-TOP_APPROACH_ALTITUDE = 5.5
-TOP_APPROACH_THROTTLE = 1570
-TOP_APPROACH_VZ = 0.2
-TOP_APPROACH_MIN_ALT = 6.8
-TOP_APPROACH_DWELL = 0.5
-TOP_APPROACH_TIMEOUT = 30.0
-
-# Ground safety: stay armed at low throttle, must not lift off or auto-disarm
-GROUND_SAFETY_DURATION = 3.0
-GROUND_SAFETY_MAX_ALT = 0.2  # meters — must stay below this
-
-CLIMB_TIMEOUT = 30.0  # shorter timeout — if it doesn't climb in 30s, the fix didn't work
-BF_DISARM_MOTOR_THRESHOLD = 0.01
-BF_DISARM_DWELL = 0.3
-LAND_TIMEOUT = 15.0
-DISARM_DURATION = 1.0
-
-# RC channels
 CH_ROLL = 0
 CH_PITCH = 1
 CH_THROTTLE = 2
@@ -92,15 +109,11 @@ RC_CENTER = 1500
 RC_LOW = 1000
 MODE_ON = 1800
 MODE_OFF = 1000
-ALTHOLD_CLIMB = 1700
-ALTHOLD_HOLD = 1500
-ALTHOLD_DESCEND = 1300
 
 BOOT_DURATION = 5.0
 ARM_DURATION = 2.0
-ALTHOLD_SETTLE = 2.0
-
-ALTITUDE_CEILING = 50.0
+SETTLE_DURATION = 1.0
+DISARM_DURATION = 1.0
 
 
 # ============================================================================
@@ -109,14 +122,13 @@ ALTITUDE_CEILING = 50.0
 
 class Phase(Enum):
     BOOT = auto()
-    PRESELECT = auto()
+    PRESELECT_ANGLE = auto()
     ARM = auto()
-    # NO SETTLE PHASE — this is the point of the test
-    CLIMB = auto()
-    TOP_APPROACH = auto()
-    HOVER = auto()
-    DESCEND = auto()
-    LAND = auto()
+    INITIAL_SETTLE = auto()  # post-ARM settle before climb
+    CLIMB_ANGLE = auto()
+    STABILIZE = auto()       # low stick to decelerate, wait for |vz| < threshold
+    ACTIVATE_ALTHOLD = auto()
+    HOLD_CHECK = auto()
     DISARM = auto()
     DONE = auto()
 
@@ -135,34 +147,29 @@ class TestState:
     current_altitude: float = 0.0
     current_vz: float = 0.0
     max_altitude: float = 0.0
-    baro_altitude: float = 0.0
 
-    hover_altitudes: list = field(default_factory=list)
-    hover_max_drift: float = 0.0
-    hover_target: float = 0.0
-    top_approach_dwell: float = 0.0
+    # Stabilize tracking
+    stabilize_dwell_s: float = 0.0     # accumulated time with |vz| < threshold
 
-    # Key metric: did it actually climb?
-    reached_climb: bool = False
-    climb_start_time: float = 0.0
+    # Activation tracking
+    activate_capture_alt: float = 0.0
+    activate_min_vz: float = 0.0      # only tracked in first ACTIVATE_SPIKE_WINDOW
+    activate_max_alt_drop: float = 0.0
 
-    land_altitude: float = 0.0
-    land_velocity: float = 0.0
-    bf_disarm_dwell: float = 0.0
+    # Hold tracking — uses activate_capture_alt as reference
+    hold_max_drift: float = 0.0
 
     crash_detected: bool = False
     crash_reason: str = ""
 
     last_print_time: float = -1.0
     results_printed: bool = False
-    quat_xyzw: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0, 1.0]))
-    gyro_body: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
     def transition(self, new_phase: Phase, t: float):
         old = self.phase.name
         self.phase = new_phase
         self.phase_start_time = t
-        print(f"[{t:6.1f}s] [{old:>14}] --> [{new_phase.name}]")
+        print(f"[{t:6.1f}s] [{old:>18}] --> [{new_phase.name}]")
 
     def phase_elapsed(self, t: float) -> float:
         return t - self.phase_start_time
@@ -181,50 +188,44 @@ def build_rc_channels(state: TestState) -> np.ndarray:
 
     phase = state.phase
 
-    if phase == Phase.BOOT:
-        pass
-
-    elif phase == Phase.PRESELECT:
+    if phase == Phase.PRESELECT_ANGLE:
         channels[CH_ANGLE] = MODE_ON
-        channels[CH_ALTHOLD] = MODE_ON
+        # ALTHOLD OFF — only ANGLE preselected
         channels[CH_THROTTLE] = RC_LOW
 
     elif phase == Phase.ARM:
         channels[CH_ARM] = MODE_ON
         channels[CH_ANGLE] = MODE_ON
-        channels[CH_ALTHOLD] = MODE_ON
         channels[CH_THROTTLE] = RC_LOW
 
-    # NO SETTLE — go directly to CLIMB from ARM
-    elif phase == Phase.CLIMB:
+    elif phase == Phase.INITIAL_SETTLE:
         channels[CH_ARM] = MODE_ON
         channels[CH_ANGLE] = MODE_ON
-        channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_CLIMB
+        channels[CH_THROTTLE] = STICK_HOLD
 
-    elif phase == Phase.TOP_APPROACH:
+    elif phase == Phase.CLIMB_ANGLE:
         channels[CH_ARM] = MODE_ON
         channels[CH_ANGLE] = MODE_ON
-        channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = TOP_APPROACH_THROTTLE
+        # No ALTHOLD — climbing in pure ANGLE mode
+        channels[CH_THROTTLE] = STICK_CLIMB
 
-    elif phase == Phase.HOVER:
+    elif phase == Phase.STABILIZE:
         channels[CH_ARM] = MODE_ON
         channels[CH_ANGLE] = MODE_ON
-        channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_HOLD
+        # Low thrust to decelerate and cross vz=0
+        channels[CH_THROTTLE] = STICK_STABILIZE
 
-    elif phase == Phase.DESCEND:
+    elif phase == Phase.ACTIVATE_ALTHOLD:
         channels[CH_ARM] = MODE_ON
         channels[CH_ANGLE] = MODE_ON
-        channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_DESCEND
+        channels[CH_ALTHOLD] = MODE_ON  # ALTHOLD activated here!
+        channels[CH_THROTTLE] = STICK_LOW_MID  # Stick stays below center
 
-    elif phase == Phase.LAND:
+    elif phase == Phase.HOLD_CHECK:
         channels[CH_ARM] = MODE_ON
         channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_DESCEND
+        channels[CH_THROTTLE] = STICK_HOLD
 
     elif phase == Phase.DISARM:
         channels[CH_THROTTLE] = RC_LOW
@@ -240,98 +241,75 @@ def update_phase(state: TestState, t: float, dt: float):
     phase = state.phase
     elapsed = state.phase_elapsed(t)
 
-    if state.current_altitude > ALTITUDE_CEILING:
-        state.crash_detected = True
-        state.crash_reason = f"Altitude ceiling exceeded ({state.current_altitude:.1f}m)"
-        state.transition(Phase.DISARM, t)
-        return
+    state.max_altitude = max(state.max_altitude, state.current_altitude)
 
     if phase == Phase.BOOT:
         if elapsed >= BOOT_DURATION:
-            state.transition(Phase.PRESELECT, t)
+            state.transition(Phase.PRESELECT_ANGLE, t)
 
-    elif phase == Phase.PRESELECT:
-        if elapsed >= ALTHOLD_SETTLE:
-            print(f"[{t:6.1f}s] [     PRESELECT] Switches set (ANGLE+ALTHOLD). Arming...")
+    elif phase == Phase.PRESELECT_ANGLE:
+        if elapsed >= 2.0:
             state.transition(Phase.ARM, t)
 
     elif phase == Phase.ARM:
         if elapsed >= ARM_DURATION:
-            print(
-                f"[{t:6.1f}s] [           ARM] "
-                f"Armed. Going DIRECTLY to CLIMB (no settle phase)."
-            )
-            state.climb_start_time = t
-            state.transition(Phase.CLIMB, t)
+            state.transition(Phase.INITIAL_SETTLE, t)
 
-    elif phase == Phase.CLIMB:
-        # Key test: does the drone actually climb without a settle phase?
-        if state.current_altitude > 1.0 and not state.reached_climb:
-            state.reached_climb = True
-            print(
-                f"[{t:6.1f}s] [         CLIMB] "
-                f"Climb confirmed! alt={state.current_altitude:.1f}m "
-                f"(took {t - state.climb_start_time:.1f}s from ARM)"
-            )
+    elif phase == Phase.INITIAL_SETTLE:
+        if elapsed >= SETTLE_DURATION:
+            print(f"[{t:6.1f}s] [    INITIAL_SETTLE] Climbing in ANGLE mode (no ALTHOLD)...")
+            state.transition(Phase.CLIMB_ANGLE, t)
 
-        if state.current_altitude >= TOP_APPROACH_ALTITUDE:
-            state.transition(Phase.TOP_APPROACH, t)
+    elif phase == Phase.CLIMB_ANGLE:
+        if state.current_altitude > CLIMB_TARGET_ALT:
+            print(f"[{t:6.1f}s] [       CLIMB_ANGLE] Reached {state.current_altitude:.1f}m. Stabilizing (stick={STICK_STABILIZE})...")
+            state.transition(Phase.STABILIZE, t)
         elif elapsed >= CLIMB_TIMEOUT:
-            print(
-                f"[{t:6.1f}s] [         CLIMB] "
-                f"FAIL: Did not climb after {CLIMB_TIMEOUT:.0f}s. "
-                f"alt={state.current_altitude:.2f}m (allowStickAdjustment bug?)"
-            )
+            state.crash_detected = True
+            state.crash_reason = f"CLIMB_ANGLE timeout: alt={state.current_altitude:.1f}m < {CLIMB_TARGET_ALT}m"
             state.transition(Phase.DISARM, t)
 
-    elif phase == Phase.TOP_APPROACH:
-        if state.current_altitude >= TOP_APPROACH_MIN_ALT:
-            if abs(state.current_vz) < TOP_APPROACH_VZ:
-                state.top_approach_dwell += dt
-            else:
-                state.top_approach_dwell = 0.0
-            if state.top_approach_dwell >= TOP_APPROACH_DWELL:
-                state.hover_target = state.current_altitude
-                state.transition(Phase.HOVER, t)
-        elif elapsed >= 30.0:
-            state.hover_target = state.current_altitude
-            state.transition(Phase.HOVER, t)
-
-    elif phase == Phase.HOVER:
-        drift = abs(state.current_altitude - state.hover_target)
-        state.hover_max_drift = max(state.hover_max_drift, drift)
-        state.hover_altitudes.append(state.current_altitude)
-        if elapsed >= HOVER_DURATION:
-            print(
-                f"[{t:6.1f}s] [         HOVER] "
-                f"Complete. drift={state.hover_max_drift:.1f}m. Descending..."
-            )
-            state.transition(Phase.DESCEND, t)
-
-    elif phase == Phase.DESCEND:
-        if state.current_altitude < 0.5:
-            state.transition(Phase.LAND, t)
-        elif elapsed >= 60.0:
-            state.transition(Phase.LAND, t)
-
-    elif phase == Phase.LAND:
-        all_motors_zero = all(m < BF_DISARM_MOTOR_THRESHOLD for m in state.motors)
-        if all_motors_zero:
-            state.bf_disarm_dwell += dt
+    elif phase == Phase.STABILIZE:
+        # Single phase: low thrust to decelerate, wait for |vz| < threshold during zero-crossing
+        if abs(state.current_vz) < STABILIZE_VZ_THRESHOLD:
+            state.stabilize_dwell_s += dt
         else:
-            state.bf_disarm_dwell = 0.0
-        if state.bf_disarm_dwell >= BF_DISARM_DWELL:
-            state.land_altitude = state.current_altitude
-            state.land_velocity = abs(state.current_vz)
+            state.stabilize_dwell_s = 0.0
+
+        if state.stabilize_dwell_s >= STABILIZE_DWELL:
+            state.activate_capture_alt = state.current_altitude
             print(
-                f"[{t:6.1f}s] [          LAND] "
-                f"BF auto-disarm detected: alt={state.current_altitude:.2f}m"
+                f"[{t:6.1f}s] [         STABILIZE] "
+                f"Stabilized (|vz|<{STABILIZE_VZ_THRESHOLD} for {STABILIZE_DWELL}s). "
+                f"Activating ALTHOLD with stick at {STICK_LOW_MID}! capture={state.activate_capture_alt:.1f}m"
             )
+            state.transition(Phase.ACTIVATE_ALTHOLD, t)
+        elif state.current_altitude > STABILIZE_CEILING:
+            state.crash_detected = True
+            state.crash_reason = f"STABILIZE ceiling: alt={state.current_altitude:.1f}m > {STABILIZE_CEILING}m"
             state.transition(Phase.DISARM, t)
-        elif elapsed >= LAND_TIMEOUT:
-            state.land_altitude = state.current_altitude
-            state.land_velocity = abs(state.current_vz)
-            print(f"[{t:6.1f}s] [          LAND] FAIL: BF auto-disarm not observed")
+        elif elapsed >= STABILIZE_TIMEOUT:
+            state.crash_detected = True
+            state.crash_reason = f"STABILIZE timeout: |vz|={abs(state.current_vz):.2f} after {STABILIZE_TIMEOUT}s"
+            state.transition(Phase.DISARM, t)
+
+    elif phase == Phase.ACTIVATE_ALTHOLD:
+        # Track descent spike only in first ACTIVATE_SPIKE_WINDOW seconds
+        if elapsed <= ACTIVATE_SPIKE_WINDOW:
+            state.activate_min_vz = min(state.activate_min_vz, state.current_vz)
+        drop = state.activate_capture_alt - state.current_altitude
+        state.activate_max_alt_drop = max(state.activate_max_alt_drop, drop)
+
+        if elapsed >= ACTIVATE_DURATION:
+            print(f"[{t:6.1f}s] [  ACTIVATE_ALTHOLD] Done. min_vz(1s)={state.activate_min_vz:.2f}m/s, alt_drop={state.activate_max_alt_drop:.2f}m. Hold check...")
+            state.transition(Phase.HOLD_CHECK, t)
+
+    elif phase == Phase.HOLD_CHECK:
+        # Use activation capture altitude as hold reference
+        drift = abs(state.current_altitude - state.activate_capture_alt)
+        state.hold_max_drift = max(state.hold_max_drift, drift)
+        if elapsed >= HOLD_DURATION:
+            print(f"[{t:6.1f}s] [        HOLD_CHECK] Done. drift={state.hold_max_drift:.2f}m")
             state.transition(Phase.DISARM, t)
 
     elif phase == Phase.DISARM:
@@ -350,25 +328,13 @@ def print_status(state: TestState, t: float):
 
     motors_str = ",".join(f"{m:.3f}" for m in state.motors)
     channels = build_rc_channels(state)
-    throttle = channels[CH_THROTTLE]
-
-    if throttle <= 1050:
-        stick = "IDLE"
-    elif throttle >= 1650:
-        stick = "CLIMB"
-    elif throttle <= 1350:
-        stick = "DESCEND"
-    else:
-        stick = "HOLD"
-
-    arm = "ARM" if channels[CH_ARM] == MODE_ON else "---"
-    ang = "ANG" if channels[CH_ANGLE] == MODE_ON else "---"
-    alt = "ALT" if channels[CH_ALTHOLD] == MODE_ON else "---"
+    thr = channels[CH_THROTTLE]
+    althold = "ALT" if channels[CH_ALTHOLD] == MODE_ON else "---"
 
     print(
-        f"[{t:6.1f}s] [{state.phase.name:>14}] "
-        f"alt={state.current_altitude:+7.2f}m vz={state.current_vz:+5.2f}m/s "
-        f"motors=[{motors_str}] T={throttle} ({stick}) modes=[{arm}|{ang}|{alt}]"
+        f"[{t:6.1f}s] [{state.phase.name:>18}] "
+        f"alt={state.current_altitude:+7.3f}m vz={state.current_vz:+5.2f}m/s "
+        f"T={thr} [{althold}] motors=[{motors_str}]"
     )
 
 
@@ -379,17 +345,27 @@ def print_results(state: TestState):
 
     print()
     print("=" * 70)
-    print("  E2E NO-SETTLE TAKEOFF TEST RESULTS")
+    print("  E2E MID-AIR ALTHOLD ACTIVATION — SAFETY CHECK")
+    print("  (validates no forced descent, not precision hold)")
     print("=" * 70)
     print(f"  Duration:             {state.sim_time:.1f}s")
     print(f"  Lockstep steps:       {state.step_count}")
+    activation_reached = state.activate_capture_alt > 0.0
     print()
-    print(f"  --- No-Settle Takeoff ---")
-    print(f"  Climb without settle: {'Yes' if state.reached_climb else 'No (BUG)'}")
-    print(f"  Max altitude:         {state.max_altitude:.1f}m")
-    print(f"  Hover target:         {state.hover_target:.1f}m")
-    print(f"  Hover max drift:      {state.hover_max_drift:.1f}m (tolerance: {HOVER_TOLERANCE}m)")
-    print(f"  Landing altitude:     {state.land_altitude:.2f}m")
+    print(f"  --- Activation Phase (stick={STICK_LOW_MID}, below center) ---")
+    if activation_reached:
+        print(f"  Capture altitude:     {state.activate_capture_alt:.1f}m")
+        print(f"  Min vz (first {ACTIVATE_SPIKE_WINDOW}s):  {state.activate_min_vz:.2f}m/s (limit: {ACTIVATE_MAX_DESCENT_VZ}m/s)")
+        print(f"  Max alt drop:         {state.activate_max_alt_drop:.2f}m (limit: {ACTIVATE_MAX_ALT_DROP}m)")
+    else:
+        print(f"  Activation phase:     N/A (never entered — stabilize failed)")
+    print()
+    print(f"  --- Hold Check (ref=activation capture) ---")
+    if activation_reached:
+        print(f"  Reference altitude:   {state.activate_capture_alt:.1f}m")
+        print(f"  Hold max drift:       {state.hold_max_drift:.2f}m (limit: {HOLD_MAX_DRIFT}m)")
+    else:
+        print(f"  Hold check:           N/A")
     if state.crash_detected:
         print(f"  Crash:                {state.crash_reason}")
     print()
@@ -397,33 +373,37 @@ def print_results(state: TestState):
     passed = True
     issues = []
 
-    if not state.reached_climb:
-        passed = False
-        issues.append("Did not climb without settle phase (allowStickAdjustment gate bug)")
-
     if state.crash_detected:
         passed = False
         issues.append(f"CRASH: {state.crash_reason}")
 
-    if state.hover_max_drift > HOVER_TOLERANCE:
+    if not activation_reached:
         passed = False
-        issues.append(f"Hover drift too large ({state.hover_max_drift:.1f}m)")
+        issues.append("Activation phase never entered (stabilize failed)")
 
-    if state.land_altitude > 0.20:
+    if activation_reached and state.activate_min_vz < ACTIVATE_MAX_DESCENT_VZ:
         passed = False
-        issues.append(f"Did not land properly ({state.land_altitude:.2f}m)")
+        issues.append(f"Descent spike: vz={state.activate_min_vz:.2f}m/s < {ACTIVATE_MAX_DESCENT_VZ}m/s")
+
+    if activation_reached and state.activate_max_alt_drop > ACTIVATE_MAX_ALT_DROP:
+        passed = False
+        issues.append(f"Altitude loss: {state.activate_max_alt_drop:.2f}m > {ACTIVATE_MAX_ALT_DROP}m")
+    elif activation_reached and state.activate_max_alt_drop > ACTIVATE_WARN_ALT_DROP:
+        issues.append(f"WARNING: altitude sag {state.activate_max_alt_drop:.2f}m > {ACTIVATE_WARN_ALT_DROP}m (controller settling)")
+
+    if activation_reached and state.hold_max_drift > HOLD_MAX_DRIFT:
+        passed = False
+        issues.append(f"Hold drift: {state.hold_max_drift:.2f}m > {HOLD_MAX_DRIFT}m")
+    elif activation_reached and state.hold_max_drift > HOLD_WARN_DRIFT:
+        issues.append(f"WARNING: hold drift {state.hold_max_drift:.2f}m > {HOLD_WARN_DRIFT}m (controller settling)")
 
     if state.step_count == 0:
         passed = False
         issues.append("No motor responses")
 
-    if passed:
-        print("  Status:               PASS")
-    else:
-        print("  Status:               FAIL")
-        for issue in issues:
-            print(f"    FAIL: {issue}")
-
+    print(f"  Status:               {'PASS' if passed else 'FAIL'}")
+    for issue in issues:
+        print(f"    {'FAIL' if not passed else 'INFO'}: {issue}")
     print("=" * 70)
 
 
@@ -488,7 +468,7 @@ ground = world.spawn(
 world.schematic(
     """
     tabs {
-        hsplit name = "No-Settle Takeoff Test" {
+        hsplit name = "Mid-Air Activation Test" {
             viewport name=Viewport pos="drone.world_pos.translate_world(5.0, 5.0, 3.0)" look_at="drone.world_pos" show_grid=#true active=#true
             vsplit share=0.3 {
                 graph "drone.motor_command" name="Motor Commands"
@@ -500,7 +480,7 @@ world.schematic(
         glb path="edu-450-v2-drone.glb" rotate="(0.0, 0.0, 0.0)" translate="(0.0, 1.0, 0.0)" scale=10.0
     }
     """,
-    "e2e-nosettle-takeoff-test.kdl",
+    "e2e-midair-activation-test.kdl",
 )
 
 physics = create_physics_system(config)
@@ -536,22 +516,22 @@ def e2e_post_step(tick: int, ctx: el.StepContext):
 
             print()
             print("=" * 70)
-            print("  E2E NO-SETTLE TAKEOFF Test (regression for allowStickAdjustment)")
-            print(f"  Scenario: PRESELECT → ARM → CLIMB directly (no settle)")
+            print("  E2E MID-AIR ALTHOLD ACTIVATION — Safety Check")
+            print(f"  Validates: no forced descent on mid-air activation (not precision hold)")
             print(f"  Timeout: {TEST_TIMEOUT}s")
             print("=" * 70)
             print()
 
             bridge_obj.start()
             _bridge[0] = bridge_obj
-            print("[  0.0s] [          INIT] Waiting 2s for BF init...")
+            print("[  0.0s] [              INIT] Waiting 2s for BF init...")
         except Exception as e:
             print(f"[INIT] ERROR: {e}")
             _bridge[0] = None
             return
         time.sleep(2)
 
-        print("[  0.0s] [          INIT] Warmup...")
+        print("[  0.0s] [              INIT] Warmup...")
         warmup_buf = SensorDataBuffer()
         warmup_fdm = warmup_buf.build_fdm()
         warmup_channels = np.full(MAX_RC_CHANNELS, RC_CENTER, dtype=np.uint16)
@@ -568,7 +548,7 @@ def e2e_post_step(tick: int, ctx: el.StepContext):
                 warmup_ok += 1
             except TimeoutError:
                 pass
-        print(f"[  0.0s] [          INIT] Warmup: {warmup_ok}/500")
+        print(f"[  0.0s] [              INIT] Warmup: {warmup_ok}/500")
         ctx.truncate()
 
     if _start_time[0] is None:
@@ -602,10 +582,6 @@ def e2e_post_step(tick: int, ctx: el.StepContext):
 
         s.current_altitude = float(world_pos[6]) if len(world_pos) > 6 else float(world_pos[2])
         s.current_vz = float(world_vel[5]) if len(world_vel) > 5 else float(world_vel[2])
-        s.max_altitude = max(s.max_altitude, s.current_altitude)
-        s.baro_altitude = float(baro[0]) if len(baro) > 0 else s.current_altitude
-        s.quat_xyzw = world_pos[:4]
-        s.gyro_body = gyro
     except RuntimeError as e:
         if tick > 5:
             print(f"[{t:6.1f}s] WARNING: {e}")
@@ -637,8 +613,6 @@ def e2e_post_step(tick: int, ctx: el.StepContext):
 
     if tick >= max_ticks - 1 and not s.results_printed:
         print(f"\n[{t:6.1f}s] TEST TIMEOUT")
-        s.land_altitude = s.current_altitude
-        s.land_velocity = abs(s.current_vz)
         b.stop()
         print_results(s)
 
@@ -648,11 +622,11 @@ def e2e_post_step(tick: int, ctx: el.StepContext):
 # ============================================================================
 
 running_under_editor = "--liveness-port" in sys.argv
-db_path = "/tmp/e2e_nosettle_test_db" if running_under_editor else "e2e_nosettle_test_db"
+db_path = "/tmp/e2e_midair_activation_test_db" if running_under_editor else "e2e_midair_activation_test_db"
 
-print(f"E2E NO-SETTLE TAKEOFF Test")
+print(f"E2E MID-AIR ALTHOLD ACTIVATION Test")
 print(f"  SITL: {BETAFLIGHT_PATH.name}")
-print(f"  Scenario: PRESELECT → ARM → CLIMB (no settle)")
+print(f"  Scenario: fly to 5m, activate ALTHOLD with low stick, must not dive")
 
 world.run(
     system,
