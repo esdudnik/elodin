@@ -93,6 +93,16 @@ SimTime = ty.Annotated[
     ),
 ]
 
+# Wake turbulence noise state (Ornstein-Uhlenbeck process, 6 DOF: fx,fy,fz,tx,ty,tz)
+WakeNoise = ty.Annotated[
+    jax.Array,
+    el.Component(
+        "wake_noise",
+        el.ComponentType(el.PrimitiveType.F64, (6,)),
+        metadata={"element_names": "fx,fy,fz,tx,ty,tz"},
+    ),
+]
+
 
 @dataclass
 class Drone(el.Archetype):
@@ -107,6 +117,7 @@ class Drone(el.Archetype):
     body_thrust: BodyThrust = field(default_factory=lambda: el.SpatialForce())
     body_drag: BodyDrag = field(default_factory=lambda: jnp.zeros(3))
     sim_time: SimTime = field(default_factory=lambda: jnp.zeros(1))
+    wake_noise: WakeNoise = field(default_factory=lambda: jnp.zeros(6))
 
 
 # --- Physics Systems ---
@@ -139,6 +150,108 @@ def create_motor_dynamics(config: DroneConfig):
         return new_thrust
 
     return motor_dynamics
+
+
+def create_rotor_aero_system(config: DroneConfig):
+    """
+    Modify per-rotor thrust for aerodynamic effects:
+    1. IGE (In-Ground-Effect): thrust efficiency gain near ground (Cheeseman-Bennett)
+    2. VRS (Vortex Ring State): thrust loss when descending into own wake
+
+    Runs after motor_dynamics, before body_thrust computation.
+    Per-rotor: each motor gets its own AGL for asymmetric IGE on tilted drone.
+    """
+    motor_positions = jnp.array(config.motor_positions)
+    ground_level = config.ground_level
+    rotor_radius = config.rotor_radius
+    ige_max_gain = config.ige_max_gain
+    propwash_loss_max = config.propwash_loss_max
+    propwash_peak_ratio = config.propwash_peak_ratio
+    propwash_width = config.propwash_width
+    air_density = config.air_density
+    disk_area = jnp.pi * rotor_radius ** 2  # single rotor disk area
+    hover_thrust_per_motor = config.mass * config.gravity / 4.0  # ~1.96N
+
+    # IGE gate configuration (profile-driven, baked in at construction time)
+    thrust_gate_params = config.ige_thrust_gate
+    has_thrust_gate = thrust_gate_params is not None
+    thrust_gate_low, thrust_gate_high = thrust_gate_params if has_thrust_gate else (0.0, 1.0)
+    agl_gate_low, agl_gate_high = config.ige_agl_gate
+
+    @el.map
+    def rotor_aero(
+        thrust: MotorThrust,
+        pos: el.WorldPos,
+        vel: el.WorldVel,
+    ) -> MotorThrust:
+        """Apply IGE gain and VRS loss to per-rotor thrust."""
+        quat = pos.angular()
+
+        # --- Per-rotor IGE thrust gain ---
+        # Transform each motor position to world frame, compute per-rotor AGL.
+        # Gates are profile-driven (config.physics_profile):
+        #   baseline: thrust gate 0.65→1.0, AGL gate 0.03→0.08m — CI-stable.
+        #   strict:   thrust gate 0.3→0.6,  AGL gate 0.01→0.03m — long-term regression pressure.
+        #   full:     no thrust gate (always 1.0), AGL gate 0.01→0.03m — diagnostic profile.
+        def ige_per_motor(i, modified_thrust):
+            pt_body = motor_positions[i]
+            pt_world = pos.linear() + quat @ pt_body
+            agl = jnp.maximum(pt_world[2] - ground_level, 0.01)  # clamp to avoid div-by-zero
+
+            # Cheeseman-Bennett heuristic: base gain = k * (R/(4*agl))^2
+            ratio = rotor_radius / (4.0 * agl)
+            base_gain = jnp.clip(ige_max_gain * ratio * ratio, 0.0, ige_max_gain)
+
+            # Thrust gate (Python-time bool — JAX traces only the active branch)
+            if has_thrust_gate:
+                thrust_ratio = modified_thrust[i] / jnp.maximum(hover_thrust_per_motor, 1e-6)
+                t_gate = jnp.clip(
+                    (thrust_ratio - thrust_gate_low) / (thrust_gate_high - thrust_gate_low),
+                    0.0,
+                    1.0,
+                )
+                thrust_gate = t_gate * t_gate * (3.0 - 2.0 * t_gate)  # smoothstep
+            else:
+                thrust_gate = 1.0
+
+            # AGL gate: protects contact zone, always present
+            a_gate = jnp.clip((agl - agl_gate_low) / (agl_gate_high - agl_gate_low), 0.0, 1.0)
+            agl_gate = a_gate * a_gate * (3.0 - 2.0 * a_gate)  # smoothstep
+
+            ige_factor = 1.0 + base_gain * thrust_gate * agl_gate
+
+            return modified_thrust.at[i].set(modified_thrust[i] * ige_factor)
+
+        new_thrust = jax.lax.fori_loop(0, 4, ige_per_motor, thrust)
+
+        # --- VRS thrust loss on descent ---
+        # Compute induced velocity from BASE (pre-loss) thrust
+        total_base_thrust = jnp.sum(thrust)  # use original, not IGE-modified
+        v_induced = jnp.sqrt(jnp.maximum(total_base_thrust, 0.01) / (2.0 * air_density * 4.0 * disk_area))
+
+        # Descent speed along rotor disk normal (body Z), not world Z
+        quat_inv = quat.inverse()
+        vel_body = quat_inv @ vel.linear()
+        descent_body = jnp.maximum(-vel_body[2], 0.0)  # positive when descending in body frame
+
+        # Translation in rotor-disk plane (body XY) for VRS suppression
+        # VRS is strongest at low translation; fades with horizontal movement in disk plane
+        v_disk_plane = jnp.sqrt(vel_body[0] ** 2 + vel_body[1] ** 2)
+        vrs_suppression = 1.0 - jnp.clip(v_disk_plane / jnp.maximum(v_induced, 0.1), 0.0, 1.5) / 1.5
+
+        # Bell-shaped loss: peak at propwash_peak_ratio, Gaussian profile
+        descent_ratio = descent_body / jnp.maximum(v_induced, 0.1)
+        loss = propwash_loss_max * jnp.exp(
+            -((descent_ratio - propwash_peak_ratio) / propwash_width) ** 2
+        )
+        loss = loss * vrs_suppression
+
+        # Apply uniform loss to all rotors
+        new_thrust = new_thrust * (1.0 - loss)
+
+        return new_thrust
+
+    return rotor_aero
 
 
 def create_body_thrust_system(config: DroneConfig):
@@ -212,14 +325,25 @@ def create_apply_forces_system(config: DroneConfig):
     - Drag (world frame)
     - Gravity (world frame)
     - Multi-point ground contact (spring-damper at 4 landing points)
-    - Propwash / ground effect (near ground, when motors spinning)
+    - Wake turbulence (OU correlated noise, scales with ground proximity + descent rate)
     """
     gravity_vec = jnp.array([0.0, 0.0, -config.gravity])
     angular_drag = jnp.array(config.angular_drag)
     ge_height = config.ground_effect_height
     ge_force_std = config.ground_effect_force_std
     ge_torque_std = config.ground_effect_torque_std
+    pw_descent_force_std = config.propwash_descent_force_std
+    pw_descent_torque_std = config.propwash_descent_torque_std
     ground_level = config.ground_level
+    air_density = config.air_density
+    rotor_radius = config.rotor_radius
+    disk_area = jnp.pi * rotor_radius ** 2
+
+    # OU noise parameters
+    dt = config.sim_time_step
+    tau = config.wake_noise_tau
+    ou_decay = jnp.exp(-dt / tau)
+    ou_diffusion = jnp.sqrt(1.0 - jnp.exp(-2.0 * dt / tau))
 
     # Multi-point ground contact: 4 points at arm undersides
     contact_pts_body = jnp.array(config.contact_points)  # (4, 3) in body FLU
@@ -237,7 +361,9 @@ def create_apply_forces_system(config: DroneConfig):
         inertia: el.Inertia,
         force: el.Force,
         sim_time: SimTime,
-    ) -> el.Force:
+        motor_thrust: MotorThrust,
+        noise_state: WakeNoise,
+    ) -> tuple[el.Force, WakeNoise]:
         """Apply all forces to the body."""
         # Rotate body thrust to world frame
         quat = pos.angular()
@@ -315,27 +441,56 @@ def create_apply_forces_system(config: DroneConfig):
             torque=total_contact_torque,
         )
 
-        # Ground effect: mild turbulent force perturbation near ground
-        # (The main ground effect is baro pressure bias in sensors.py)
+        # --- Wake turbulence: OU correlated noise ---
+        # Two intensity components:
+        # 1. Ground proximity (existing): propwash bounces off ground
+        # 2. Descent-through-wake (new): flying into own downwash
+
         agl = pos.linear()[2] - ground_level
         proximity = jnp.clip((ge_height - agl) / ge_height, 0.0, 1.0)
-        total_thrust_mag = jnp.sum(jnp.abs(thrust.linear()))
-        intensity = proximity * proximity * jnp.clip(total_thrust_mag / (inertia.mass() * 9.81), 0.0, 1.0)
+        total_thrust_mag = jnp.sum(motor_thrust)
+        thrust_fraction = jnp.clip(total_thrust_mag / (inertia.mass() * 9.81), 0.0, 1.0)
 
-        t = sim_time[0] * 1000.0
-        ge_fx = jnp.sin(t * 7.13 + 0.0) * ge_force_std * intensity
-        ge_fy = jnp.sin(t * 11.37 + 2.1) * ge_force_std * intensity
-        ge_fz = jnp.sin(t * 5.79 + 4.2) * ge_force_std * intensity
-        ge_tx = jnp.sin(t * 13.41 + 1.0) * ge_torque_std * intensity
-        ge_ty = jnp.sin(t * 9.23 + 3.3) * ge_torque_std * intensity
-        ge_tz = jnp.sin(t * 6.89 + 5.5) * ge_torque_std * intensity
-        ground_effect_force = el.SpatialForce(
-            linear=jnp.array([ge_fx, ge_fy, ge_fz]),
-            torque=jnp.array([ge_tx, ge_ty, ge_tz]),
+        # Ground proximity intensity (existing behavior, improved noise model)
+        ground_intensity = proximity * proximity * thrust_fraction
+
+        # Descent-through-wake intensity (new) — uses body-frame descent, consistent with VRS
+        quat_inv = pos.angular().inverse()
+        vel_body = quat_inv @ vel.linear()
+        descent_body = jnp.maximum(-vel_body[2], 0.0)  # positive when descending in body frame
+        v_induced = jnp.sqrt(jnp.maximum(total_thrust_mag, 0.01) / (2.0 * air_density * 4.0 * disk_area))
+        descent_ratio = descent_body / jnp.maximum(v_induced, 0.1)
+        descent_intensity = jnp.clip(descent_ratio, 0.0, 2.0) ** 2 * thrust_fraction
+
+        # OU noise update: noise_next = noise_prev * decay + diffusion * randn
+        # Use JAX deterministic PRNG keyed from tick for reproducibility
+        tick_int = jnp.int32(jnp.round(sim_time[0] / dt))
+        rng_key = jax.random.PRNGKey(tick_int)
+        white_noise = jax.random.normal(rng_key, shape=(6,))
+        new_noise = noise_state * ou_decay + ou_diffusion * white_noise
+
+        # Scale noise by per-axis std dev and combined intensity
+        force_std = jnp.array([ge_force_std, ge_force_std, ge_force_std])
+        torque_std = jnp.array([ge_torque_std, ge_torque_std, ge_torque_std])
+
+        # Add descent-specific turbulence on top of ground turbulence
+        descent_force_std = jnp.array([pw_descent_force_std, pw_descent_force_std, pw_descent_force_std])
+        descent_torque_std = jnp.array([pw_descent_torque_std, pw_descent_torque_std, pw_descent_torque_std])
+
+        total_force_std = force_std * ground_intensity + descent_force_std * descent_intensity
+        total_torque_std = torque_std * ground_intensity + descent_torque_std * descent_intensity
+
+        wake_force = new_noise[:3] * total_force_std
+        wake_torque = new_noise[3:] * total_torque_std
+
+        wake_turbulence = el.SpatialForce(
+            linear=wake_force,
+            torque=wake_torque,
         )
 
         # Sum all forces
-        return force + world_thrust + gravity_force + drag_force + angular_drag_force + ground_contact_force + ground_effect_force
+        total = force + world_thrust + gravity_force + drag_force + angular_drag_force + ground_contact_force + wake_turbulence
+        return total, new_noise
 
     return apply_forces
 
@@ -448,6 +603,7 @@ def create_physics_system(config: DroneConfig) -> el.System:
     """
     # Create individual systems
     motor_dynamics = create_motor_dynamics(config)
+    rotor_aero = create_rotor_aero_system(config)
     body_thrust = create_body_thrust_system(config)
     drag = create_drag_system(config)
     apply_forces = create_apply_forces_system(config)
@@ -455,7 +611,8 @@ def create_physics_system(config: DroneConfig) -> el.System:
     time_update = create_time_update_system(config)
 
     # Effector systems (applied before integration)
-    effectors = motor_dynamics | body_thrust | drag | apply_forces
+    # Pipeline: motor_dynamics → rotor_aero (IGE/VRS) → body_thrust → drag → apply_forces
+    effectors = motor_dynamics | rotor_aero | body_thrust | drag | apply_forces
 
     # 6-DOF integrator with effectors
     physics = el.six_dof(

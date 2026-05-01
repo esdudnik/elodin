@@ -3,16 +3,13 @@ set -euo pipefail
 
 # ── Elodin + Betaflight build & run script ──
 # Run from the elodin repo root, inside `nix develop` shell.
-# Usage: ./run.sh [build-bf|rebuild-elodin|run|e2e-angle-althold|e2e-acro-althold|e2e-flight|all|check]
+# Usage: ./run.sh [build-bf|rebuild-elodin|run|e2e-all|e2e-angle-althold|...|all|check]
 #   build-bf                  - clean + build betaflight SITL .elf
 #   rebuild-elodin            - rebuild elodin (Python SDK + editor binary)
 #   run                       - just run the editor (skip rebuild)
+#   e2e-all                   - run ALL automated E2E tests sequentially
 #   e2e-angle-althold         - run ANGLE+ALTHOLD E2E test (headless)
-#   e2e-angle-althold-editor  - run ANGLE+ALTHOLD E2E test (with 3D viewport)
-#   e2e-acro-althold          - run ACRO+ALTHOLD E2E test (headless)
-#   e2e-acro-althold-editor   - run ACRO+ALTHOLD E2E test (with 3D viewport)
-#   e2e-flight                - run horizontal flight E2E test (headless)
-#   e2e-flight-editor         - run horizontal flight E2E test (with 3D viewport)
+#   e2e-*-editor              - run any E2E test with 3D viewport
 #   all                       - build-bf + rebuild-elodin + run (default)
 #   check                     - analyze log file
 
@@ -222,6 +219,278 @@ do_run() {
         "$ELODIN_BIN" editor "$EXAMPLE" 2>&1 | tee "$LOG_FILE"
 }
 
+# ── Headless E2E runner (single test) ──
+# Extracted from do_e2e headless path. Used by both individual e2e-* commands
+# and do_e2e_all(). Returns test exit code (0=pass, non-zero=fail).
+run_single_e2e() {
+    local test_script="$1"
+    local test_name="$2"
+    local log_file="/tmp/bf-e2e-${test_name}.log"
+
+    # Verify test script exists
+    if [ ! -f "$test_script" ]; then
+        echo -e "  ${RED}✗ Test script not found: $test_script${NC}"
+        return 1
+    fi
+
+    # Activate venv if not already active
+    if [[ "${VIRTUAL_ENV:-}" != *".venv"* ]]; then
+        source .venv/bin/activate
+    fi
+    unset PYTHONPATH 2>/dev/null || true
+    export PATH="$HOME/.cargo/bin:$PATH"
+
+    # Pre-flight: verify elodin Python module
+    if ! python3 -c "import elodin" 2>/dev/null; then
+        echo -e "  ${RED}✗ elodin Python module not installed. Run './run.sh rebuild-elodin' first.${NC}"
+        return 1
+    fi
+
+    # Verify BF SITL binary
+    local elf="$BETAFLIGHT_DIR/obj/main/betaflight_SITL.elf"
+    if [ ! -f "$elf" ]; then
+        echo -e "  ${RED}✗ Betaflight SITL not found at $elf. Run './run.sh build-bf' first.${NC}"
+        return 1
+    fi
+
+    # Kill stale processes from previous test
+    pkill -f betaflight_SITL 2>/dev/null || true
+    # Kill any lingering elodin-db / Python test processes holding port 2240
+    lsof -ti :2240 2>/dev/null | xargs kill -9 2>/dev/null || true
+    sleep 1
+    # Force kill any remaining BF
+    pkill -9 -f betaflight_SITL 2>/dev/null || true
+    sleep 0.5
+    # Clean up ALL stale elodin test DB directories
+    rm -rf e2e_*_db e2e_*_test_db /tmp/e2e_*_db 2>/dev/null || true
+
+    echo -e "\n${GREEN}▶ Running E2E test (headless): $test_name${NC}"
+    echo -e "  Script: $test_script"
+    echo -e "  Betaflight: $elf"
+    echo -e "  Log file: $log_file"
+
+    # Start Betaflight SITL in background
+    local bf_pid=""
+    (cd "$BETAFLIGHT_DIR" && exec "$elf") > "$log_file" 2>&1 &
+    bf_pid=$!
+
+    # Trap-based cleanup: guarantee SITL is killed on any exit from this function
+    _e2e_cleanup() {
+        if [ -n "$bf_pid" ]; then
+            kill "$bf_pid" 2>/dev/null || true
+            wait "$bf_pid" 2>/dev/null || true
+            bf_pid=""
+        fi
+    }
+    trap _e2e_cleanup RETURN
+
+    echo -e "  Betaflight SITL started (PID $bf_pid) from $BETAFLIGHT_DIR"
+    sleep 2  # wait for UDP port binding (needs extra time in suite mode)
+
+    # Fix 1: Verify SITL PID is alive before running test
+    if ! kill -0 "$bf_pid" 2>/dev/null; then
+        echo -e "  ${RED}✗ Betaflight SITL died during startup (PID $bf_pid)${NC}"
+        trap - RETURN
+        return 1
+    fi
+
+    # Run test — capture exit code without triggering set -e
+    local test_exit=0
+    PYTHONUNBUFFERED=1 \
+        python3 "$test_script" run --no-s10 2>&1 | tee -a "$log_file" || test_exit=$?
+
+    # Clear trap before normal cleanup
+    trap - RETURN
+    _e2e_cleanup
+
+    return $test_exit
+}
+
+# ── Focused suite for strict/full physics profile investigations ──
+# Used to reproduce real-hardware "floating" behavior under realistic IGE.
+# Tests are the ones strict_test.md identified as IGE-sensitive.
+FOCUSED_TESTS=(
+    "ground-idle:$E2E_GROUND_IDLE_SCRIPT"
+    "nosettle-takeoff:$E2E_NOSETTLE_SCRIPT"
+    "failsafe-althold:$E2E_FAILSAFE_SCRIPT"
+    "failsafe-init:$E2E_FAILSAFE_INIT_SCRIPT"
+    "midair-activation:$E2E_MIDAIR_SCRIPT"
+)
+
+# Parse a runs argument. Accepts "5", "--runs=5", or empty (defaults to 1).
+parse_runs() {
+    local arg="${1:-1}"
+    case "$arg" in
+        --runs=*) echo "${arg#--runs=}" ;;
+        ''|*[!0-9]*) echo "1" ;;
+        *) echo "$arg" ;;
+    esac
+}
+
+# Run focused suite under a given E2E_PHYSICS_PROFILE for N runs.
+# Tracks per-test pass/fail counts across runs and prints a summary.
+do_focused_suite() {
+    local profile="$1"
+    local runs
+    runs=$(parse_runs "${2:-1}")
+
+    export E2E_PHYSICS_PROFILE="$profile"
+
+    local total_tests=${#FOCUSED_TESTS[@]}
+    local total_runs=$((runs * total_tests))
+    local total_passed=0
+    local total_failed=0
+
+    # Per-test pass counters (parallel arrays — bash 3.2 compat, no associative arrays)
+    local test_names=()
+    local test_passes=()
+    local test_fails=()
+    for entry in "${FOCUSED_TESTS[@]}"; do
+        test_names+=("${entry%%:*}")
+        test_passes+=(0)
+        test_fails+=(0)
+    done
+
+    local suite_start
+    suite_start=$(date +%s)
+
+    echo ""
+    echo "========================================================================"
+    echo "  FOCUSED SUITE — profile=$profile  runs=$runs  tests=$total_tests"
+    echo "========================================================================"
+
+    local run_idx=0
+    while [ "$run_idx" -lt "$runs" ]; do
+        run_idx=$((run_idx + 1))
+        echo -e "\n────── Run $run_idx / $runs ──────"
+
+        local i=0
+        for entry in "${FOCUSED_TESTS[@]}"; do
+            local name="${entry%%:*}"
+            local script="${entry#*:}"
+
+            echo -e "\n━━━ [run $run_idx] $name ━━━"
+
+            local rc=0
+            if run_single_e2e "$script" "${profile}-${name}-r${run_idx}"; then
+                rc=0
+                test_passes[$i]=$((${test_passes[$i]} + 1))
+                total_passed=$((total_passed + 1))
+            else
+                rc=$?
+                test_fails[$i]=$((${test_fails[$i]} + 1))
+                total_failed=$((total_failed + 1))
+            fi
+            i=$((i + 1))
+        done
+    done
+
+    local suite_end
+    suite_end=$(date +%s)
+    local suite_duration=$((suite_end - suite_start))
+    local suite_min=$((suite_duration / 60))
+    local suite_sec=$((suite_duration % 60))
+
+    echo ""
+    echo "========================================================================"
+    echo "  FOCUSED SUITE RESULTS — profile=$profile  runs=$runs"
+    echo "========================================================================"
+    echo "  Total: $total_runs  Passed: $total_passed  Failed: $total_failed  Duration: ${suite_min}m ${suite_sec}s"
+    echo ""
+    echo "  Per-test pass rates (across $runs runs):"
+    local i=0
+    for name in "${test_names[@]}"; do
+        local p="${test_passes[$i]}"
+        local f="${test_fails[$i]}"
+        printf "    %-22s  %d/%d pass  (%d fail)\n" "$name" "$p" "$runs" "$f"
+        i=$((i + 1))
+    done
+    echo ""
+    echo "  Per-run logs: /tmp/bf-e2e-${profile}-<test>-r<N>.log"
+    echo "========================================================================"
+
+    [ $total_failed -eq 0 ] && return 0 || return 1
+}
+
+# ── Run all automated E2E tests sequentially ──
+do_e2e_all() {
+    local tests=(
+        "e2e-ground-idle:$E2E_GROUND_IDLE_SCRIPT"
+        "e2e-smooth-takeoff:$E2E_SMOOTH_TAKEOFF_SCRIPT"
+        "e2e-center-semantics:$E2E_CENTER_SCRIPT"
+        "e2e-nosettle-takeoff:$E2E_NOSETTLE_SCRIPT"
+        "e2e-angle-althold:$E2E_SCRIPT"
+        "e2e-acro-althold:$E2E_ACRO_SCRIPT"
+        "e2e-flight:$E2E_FLIGHT_SCRIPT"
+        "e2e-failsafe-althold:$E2E_FAILSAFE_SCRIPT"
+        "e2e-failsafe-init:$E2E_FAILSAFE_INIT_SCRIPT"
+        "e2e-midair-activation:$E2E_MIDAIR_SCRIPT"
+        "e2e-poshold:$E2E_POSHOLD_SCRIPT"
+    )
+
+    local total=${#tests[@]}
+    local passed=0
+    local failed=0
+    local results=()
+    local suite_start
+    suite_start=$(date +%s)
+
+    echo ""
+    echo "========================================================================"
+    echo "  E2E TEST SUITE — $total automated tests"
+    echo "========================================================================"
+
+    local idx=0
+    for entry in "${tests[@]}"; do
+        idx=$((idx + 1))
+        local name="${entry%%:*}"
+        local script="${entry#*:}"
+        local test_start
+        test_start=$(date +%s)
+
+        echo -e "\n━━━ [$idx/$total] $name ━━━"
+
+        # Guarded execution — no set -e cascade
+        local rc=0
+        if run_single_e2e "$script" "$name"; then
+            rc=0
+        else
+            rc=$?
+        fi
+
+        local test_end
+        test_end=$(date +%s)
+        local duration=$((test_end - test_start))
+
+        if [ $rc -eq 0 ]; then
+            passed=$((passed + 1))
+            results+=("  PASS  ${duration}s  $name")
+        else
+            failed=$((failed + 1))
+            results+=("  FAIL  ${duration}s  $name  (log: /tmp/bf-e2e-${name}.log)")
+        fi
+    done
+
+    local suite_end
+    suite_end=$(date +%s)
+    local suite_duration=$((suite_end - suite_start))
+    local suite_min=$((suite_duration / 60))
+    local suite_sec=$((suite_duration % 60))
+
+    echo ""
+    echo "========================================================================"
+    echo "  E2E TEST SUITE RESULTS"
+    echo "========================================================================"
+    echo "  Total: $total  Passed: $passed  Failed: $failed  Duration: ${suite_min}m ${suite_sec}s"
+    echo ""
+    for r in "${results[@]}"; do
+        echo "$r"
+    done
+    echo "========================================================================"
+
+    [ $failed -eq 0 ] && return 0 || return 1
+}
+
 do_e2e() {
     local MODE="${1:-headless}"
 
@@ -327,77 +596,88 @@ case "$MODE" in
         do_rebuild
         do_run
         ;;
+    e2e-all)
+        do_e2e_all
+        ;;
     e2e-angle-althold)
-        do_e2e headless
+        run_single_e2e "$E2E_SCRIPT" "angle-althold"
         ;;
     e2e-angle-althold-editor)
         do_e2e editor
         ;;
     e2e-acro-althold)
-        E2E_SCRIPT="$E2E_ACRO_SCRIPT" do_e2e headless
+        run_single_e2e "$E2E_ACRO_SCRIPT" "acro-althold"
         ;;
     e2e-acro-althold-editor)
         E2E_SCRIPT="$E2E_ACRO_SCRIPT" do_e2e editor
         ;;
     e2e-flight)
-        E2E_SCRIPT="$E2E_FLIGHT_SCRIPT" do_e2e headless
+        run_single_e2e "$E2E_FLIGHT_SCRIPT" "flight"
         ;;
     e2e-flight-editor)
         E2E_SCRIPT="$E2E_FLIGHT_SCRIPT" do_e2e editor
         ;;
     e2e-failsafe-althold)
-        E2E_SCRIPT="$E2E_FAILSAFE_SCRIPT" do_e2e headless
+        run_single_e2e "$E2E_FAILSAFE_SCRIPT" "failsafe-althold"
         ;;
     e2e-failsafe-althold-editor)
         E2E_SCRIPT="$E2E_FAILSAFE_SCRIPT" do_e2e editor
         ;;
     e2e-poshold)
-        E2E_SCRIPT="$E2E_POSHOLD_SCRIPT" do_e2e headless
+        run_single_e2e "$E2E_POSHOLD_SCRIPT" "poshold"
         ;;
     e2e-poshold-editor)
         E2E_SCRIPT="$E2E_POSHOLD_SCRIPT" do_e2e editor
         ;;
     e2e-nosettle-takeoff)
-        E2E_SCRIPT="$E2E_NOSETTLE_SCRIPT" do_e2e headless
+        run_single_e2e "$E2E_NOSETTLE_SCRIPT" "nosettle-takeoff"
         ;;
     e2e-failsafe-init)
-        E2E_SCRIPT="$E2E_FAILSAFE_INIT_SCRIPT" do_e2e headless
+        run_single_e2e "$E2E_FAILSAFE_INIT_SCRIPT" "failsafe-init"
         ;;
     e2e-ground-idle)
-        E2E_SCRIPT="$E2E_GROUND_IDLE_SCRIPT" do_e2e headless
+        run_single_e2e "$E2E_GROUND_IDLE_SCRIPT" "ground-idle"
         ;;
     e2e-center-semantics)
-        E2E_SCRIPT="$E2E_CENTER_SCRIPT" do_e2e headless
+        run_single_e2e "$E2E_CENTER_SCRIPT" "center-semantics"
         ;;
     e2e-midair-activation)
-        E2E_SCRIPT="$E2E_MIDAIR_SCRIPT" do_e2e headless
+        run_single_e2e "$E2E_MIDAIR_SCRIPT" "midair-activation"
         ;;
     e2e-smooth-takeoff)
-        E2E_SCRIPT="$E2E_SMOOTH_TAKEOFF_SCRIPT" do_e2e headless
+        run_single_e2e "$E2E_SMOOTH_TAKEOFF_SCRIPT" "smooth-takeoff"
+        ;;
+    e2e-strict)
+        do_focused_suite strict "${2:-1}"
+        ;;
+    e2e-full)
+        do_focused_suite full "${2:-1}"
         ;;
     check)
         do_check_logs
         ;;
     *)
-        echo "Usage: ./run.sh [build-bf|rebuild-elodin|run|e2e-angle-althold|e2e-acro-althold|e2e-flight|all|check]"
+        echo "Usage: ./run.sh [build-bf|rebuild-elodin|run|e2e-all|e2e-*|all|check]"
         echo "  build-bf                  - clean + build betaflight SITL .elf"
         echo "  rebuild-elodin            - rebuild elodin (Python SDK + editor binary)"
         echo "  run                       - run editor (skip rebuild)"
-        echo "  e2e-angle-althold         - run ANGLE+ALTHOLD E2E test (headless)"
-        echo "  e2e-angle-althold-editor  - run ANGLE+ALTHOLD E2E test (with 3D viewport)"
-        echo "  e2e-acro-althold          - run ACRO+ALTHOLD E2E test (headless)"
-        echo "  e2e-acro-althold-editor   - run ACRO+ALTHOLD E2E test (with 3D viewport)"
-        echo "  e2e-flight                - run horizontal flight E2E test (headless)"
-        echo "  e2e-flight-editor         - run horizontal flight E2E test (with 3D viewport)"
-        echo "  e2e-failsafe-althold      - run failsafe landing E2E test (headless)"
-        echo "  e2e-failsafe-althold-editor - run failsafe landing E2E test (with 3D viewport)"
-        echo "  e2e-poshold               - run POSHOLD E2E test (headless)"
-        echo "  e2e-poshold-editor        - run POSHOLD E2E test (with 3D viewport)"
-        echo "  e2e-center-semantics      - run center-stick semantics E2E test (headless)"
-        echo "  e2e-midair-activation     - run mid-air ALTHOLD activation E2E test (headless)"
-        echo "  e2e-smooth-takeoff        - run smooth takeoff ramp E2E test (headless)"
-        echo "  all                   - build-bf + rebuild-elodin + run (default)"
-        echo "  check                 - analyze log file at $LOG_FILE"
+        echo "  e2e-all                   - run ALL automated E2E tests sequentially"
+        echo "  e2e-ground-idle           - ground idle regression test"
+        echo "  e2e-smooth-takeoff        - smooth takeoff ramp test"
+        echo "  e2e-center-semantics      - center-stick semantics test"
+        echo "  e2e-nosettle-takeoff      - no-settle takeoff FSM test"
+        echo "  e2e-angle-althold         - ANGLE+ALTHOLD flight cycle test"
+        echo "  e2e-acro-althold          - ACRO+ALTHOLD flight cycle test"
+        echo "  e2e-flight                - horizontal flight test"
+        echo "  e2e-failsafe-althold      - failsafe landing test"
+        echo "  e2e-failsafe-init         - failsafe from INITIALIZE test"
+        echo "  e2e-midair-activation     - mid-air ALTHOLD activation safety test"
+        echo "  e2e-poshold               - position hold test"
+        echo "  e2e-*-editor              - any test above with 3D viewport (e.g. e2e-angle-althold-editor)"
+        echo "  e2e-strict [N|--runs=N]   - focused suite under strict physics profile, N runs"
+        echo "  e2e-full   [N|--runs=N]   - focused suite under full physics profile (no thrust gate), N runs"
+        echo "  all                       - build-bf + rebuild-elodin + run (default)"
+        echo "  check                     - analyze log file at $LOG_FILE"
         exit 1
         ;;
 esac

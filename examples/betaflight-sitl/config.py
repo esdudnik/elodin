@@ -36,6 +36,7 @@ Motor Index Mapping (what we RECEIVE from SITL, after Gazebo remapping):
     motor[3] = Back Right (BR, CW, spin -1)   - originally BF motor 0
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import ClassVar, Optional, Self
 import numpy as np
@@ -190,16 +191,45 @@ class DroneConfig:
     baro_bias_delay_s: float = 15.0       # seconds — bias starts after this sim time (after arm + baro zero)
     baro_bias_ramp_s: float = 1.0         # seconds — linear ramp from 0 to full bias
 
-    # Ground effect / propwash parameters
-    # Near ground with motors spinning, prop wash bounces off surface:
-    #   baro_bias (negative) → baro reads lower altitude → ALT_HOLD over-thrusts
-    #   force_std → turbulent force perturbation (N) in all axes
-    #   torque_std → turbulent torque perturbation (N·m) in all axes
-    # All scale with: proximity² × thrust_fraction, active within ground_effect_height AGL
+    # --- Rotor Aerodynamics ---
+
+    # Rotor radius (5" prop = 0.127m diameter / 2)
+    rotor_radius: float = 0.065
+
+    # In-Ground-Effect (IGE) thrust gain — Cheeseman-Bennett model (heuristic).
+    # Near ground, reduced downwash expansion increases rotor efficiency.
+    # gain_factor = 1 + ige_max_gain * clamp((R / (4*agl))^2, 0, 1)
+    ige_max_gain: float = 0.15            # max 15% thrust efficiency increase at ground level
+
+    # Physics profile for IGE gating. Selectable via E2E_PHYSICS_PROFILE env var.
+    #   baseline: current gates (thrust 0.65→1.0, AGL 0.03→0.08m). CI default, regression gate.
+    #   strict:   reduced thrust gate (0.3→0.6), tightened AGL (0.01→0.03m). Long-term regression pressure.
+    #   full:     no thrust gate at all, AGL 0.01→0.03m. Diagnostic profile that guarantees real-physics
+    #             "floating" failures reproduce. Used for controller investigation, not CI.
+    # Other physics (VRS, wake turbulence, baro bias) are unchanged across profiles.
+    physics_profile: str = field(
+        default_factory=lambda: os.environ.get("E2E_PHYSICS_PROFILE", "baseline")
+    )
+
+    # Propwash thrust loss on descent (VRS-like).
+    # Descending into own wake reduces effective thrust. Bell-shaped loss profile:
+    # peak at descent_ratio ≈ 0.8 (VRS onset), partial recovery at deeper descent.
+    # Suppressed at high horizontal speed (VRS is low-translation phenomenon).
+    propwash_loss_max: float = 0.12       # max 12% thrust reduction at VRS peak
+    propwash_peak_ratio: float = 0.8      # descent_ratio at peak loss (fraction of induced velocity)
+    propwash_width: float = 0.4           # Gaussian width of loss profile
+
+    # --- Wake Turbulence ---
+    # Replaces old fixed-frequency sine perturbation with Ornstein-Uhlenbeck
+    # correlated noise. Scales with proximity² (ground) + descent_ratio² (wake).
+
     ground_effect_height: float = 0.50    # meters — effect zone AGL
-    ground_effect_baro_bias: float = -0.20  # meters — negative = baro reads lower altitude near ground
-    ground_effect_force_std: float = 0.05   # Newtons — near-ground force disturbance (limit for D=10/10)
-    ground_effect_torque_std: float = 0.001 # N·m — mild near-ground torque disturbance
+    ground_effect_baro_bias: float = -0.10  # meters — negative = baro reads lower (halved for IGE coexistence)
+    ground_effect_force_std: float = 0.05   # Newtons — near-ground force disturbance
+    ground_effect_torque_std: float = 0.001 # N·m — near-ground torque disturbance
+    propwash_descent_force_std: float = 0.15  # N — turbulence force when descending through wake
+    propwash_descent_torque_std: float = 0.003  # N·m — turbulence torque when descending through wake
+    wake_noise_tau: float = 0.05          # seconds — OU noise correlation time (50ms)
 
     # Ground contact model parameters (multi-point spring-damper)
     # Contact points are at motor XY positions but offset below body center
@@ -340,6 +370,28 @@ class DroneConfig:
         Plus yaw torque from motor spin.
         """
         return np.cross(self.motor_positions, self.motor_thrust_directions)
+
+    @property
+    def ige_thrust_gate(self) -> Optional[tuple[float, float]]:
+        """
+        IGE thrust-fraction smoothstep gate as (low, high), or None for no gate.
+        None means thrust gate is always 1.0 (full IGE regardless of thrust).
+        """
+        if self.physics_profile == "strict":
+            return (0.3, 0.6)
+        if self.physics_profile == "full":
+            return None
+        return (0.65, 1.0)  # baseline
+
+    @property
+    def ige_agl_gate(self) -> tuple[float, float]:
+        """
+        IGE AGL smoothstep gate as (low, high) in meters. Always present —
+        the AGL gate protects the contact zone and is physically meaningful.
+        """
+        if self.physics_profile in ("strict", "full"):
+            return (0.01, 0.03)
+        return (0.03, 0.08)  # baseline
 
     @property
     def hover_throttle(self) -> float:
