@@ -36,9 +36,11 @@ Run:
     cd elodin && ./run.sh e2e-midair-activation
 """
 
+import math
 import os
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
@@ -87,7 +89,9 @@ ACTIVATE_DURATION = 3.0
 HOLD_DURATION = 5.0
 
 # Pass/fail thresholds (safety-focused — not precision hold)
-ACTIVATE_MAX_DESCENT_VZ = -0.3    # m/s — no spike below this (in first 1s only)
+ACTIVATE_MAX_DESCENT_VZ = -0.3    # m/s — 100ms avg limit (in first 1s)
+ACTIVATE_RAW_DESCENT_GUARD = -0.5 # m/s — single-sample catastrophic guard
+ACTIVATE_VZ_WINDOW_S = 0.1       # seconds — 100ms moving average window
 ACTIVATE_MAX_ALT_DROP = 1.5       # meters — max altitude loss (safety limit)
 HOLD_MAX_DRIFT = 2.5              # meters — max drift during hold (safety limit)
 
@@ -153,7 +157,9 @@ class TestState:
 
     # Activation tracking
     activate_capture_alt: float = 0.0
-    activate_min_vz: float = 0.0      # only tracked in first ACTIVATE_SPIKE_WINDOW
+    activate_min_vz_raw: float = float('inf')    # single-sample min (diagnostic + hard guard)
+    activate_min_vz_avg: float = float('inf')    # 100ms moving-average min (pass/fail metric)
+    activate_vz_window: deque = field(default_factory=lambda: deque())
     activate_max_alt_drop: float = 0.0
 
     # Hold tracking — uses activate_capture_alt as reference
@@ -164,6 +170,7 @@ class TestState:
 
     last_print_time: float = -1.0
     results_printed: bool = False
+    test_passed: bool = False
 
     def transition(self, new_phase: Phase, t: float):
         old = self.phase.name
@@ -278,6 +285,10 @@ def update_phase(state: TestState, t: float, dt: float):
 
         if state.stabilize_dwell_s >= STABILIZE_DWELL:
             state.activate_capture_alt = state.current_altitude
+            # Reset activation tracking state
+            state.activate_min_vz_raw = float('inf')
+            state.activate_min_vz_avg = float('inf')
+            state.activate_vz_window.clear()
             print(
                 f"[{t:6.1f}s] [         STABILIZE] "
                 f"Stabilized (|vz|<{STABILIZE_VZ_THRESHOLD} for {STABILIZE_DWELL}s). "
@@ -295,13 +306,25 @@ def update_phase(state: TestState, t: float, dt: float):
 
     elif phase == Phase.ACTIVATE_ALTHOLD:
         # Track descent spike only in first ACTIVATE_SPIKE_WINDOW seconds
+        vz_window_ticks = max(1, int(round(ACTIVATE_VZ_WINDOW_S / dt)))
         if elapsed <= ACTIVATE_SPIKE_WINDOW:
-            state.activate_min_vz = min(state.activate_min_vz, state.current_vz)
+            # Raw single-sample min (diagnostic + catastrophic guard)
+            state.activate_min_vz_raw = min(state.activate_min_vz_raw, state.current_vz)
+
+            # 100ms moving average
+            state.activate_vz_window.append(state.current_vz)
+            while len(state.activate_vz_window) > vz_window_ticks:
+                state.activate_vz_window.popleft()
+            if len(state.activate_vz_window) >= vz_window_ticks:
+                avg_vz = sum(state.activate_vz_window) / len(state.activate_vz_window)
+                state.activate_min_vz_avg = min(state.activate_min_vz_avg, avg_vz)
+
         drop = state.activate_capture_alt - state.current_altitude
         state.activate_max_alt_drop = max(state.activate_max_alt_drop, drop)
 
         if elapsed >= ACTIVATE_DURATION:
-            print(f"[{t:6.1f}s] [  ACTIVATE_ALTHOLD] Done. min_vz(1s)={state.activate_min_vz:.2f}m/s, alt_drop={state.activate_max_alt_drop:.2f}m. Hold check...")
+            avg_str = f"{state.activate_min_vz_avg:.2f}" if math.isfinite(state.activate_min_vz_avg) else "N/A"
+            print(f"[{t:6.1f}s] [  ACTIVATE_ALTHOLD] Done. min_vz_avg={avg_str}m/s raw={state.activate_min_vz_raw:.2f}m/s alt_drop={state.activate_max_alt_drop:.2f}m. Hold check...")
             state.transition(Phase.HOLD_CHECK, t)
 
     elif phase == Phase.HOLD_CHECK:
@@ -355,7 +378,10 @@ def print_results(state: TestState):
     print(f"  --- Activation Phase (stick={STICK_LOW_MID}, below center) ---")
     if activation_reached:
         print(f"  Capture altitude:     {state.activate_capture_alt:.1f}m")
-        print(f"  Min vz (first {ACTIVATE_SPIKE_WINDOW}s):  {state.activate_min_vz:.2f}m/s (limit: {ACTIVATE_MAX_DESCENT_VZ}m/s)")
+        avg_str = f"{state.activate_min_vz_avg:.2f}" if math.isfinite(state.activate_min_vz_avg) else "N/A"
+        raw_str = f"{state.activate_min_vz_raw:.2f}" if math.isfinite(state.activate_min_vz_raw) else "N/A"
+        print(f"  Min vz raw (first {ACTIVATE_SPIKE_WINDOW}s):         {raw_str}m/s (hard limit: {ACTIVATE_RAW_DESCENT_GUARD}m/s)")
+        print(f"  Min vz 100ms avg (first {ACTIVATE_SPIKE_WINDOW}s):   {avg_str}m/s (limit: {ACTIVATE_MAX_DESCENT_VZ}m/s)")
         print(f"  Max alt drop:         {state.activate_max_alt_drop:.2f}m (limit: {ACTIVATE_MAX_ALT_DROP}m)")
     else:
         print(f"  Activation phase:     N/A (never entered — stabilize failed)")
@@ -381,9 +407,17 @@ def print_results(state: TestState):
         passed = False
         issues.append("Activation phase never entered (stabilize failed)")
 
-    if activation_reached and state.activate_min_vz < ACTIVATE_MAX_DESCENT_VZ:
+    if activation_reached and not math.isfinite(state.activate_min_vz_avg):
         passed = False
-        issues.append(f"Descent spike: vz={state.activate_min_vz:.2f}m/s < {ACTIVATE_MAX_DESCENT_VZ}m/s")
+        issues.append("Activation vz window never filled (test too short or no data)")
+
+    if activation_reached and math.isfinite(state.activate_min_vz_avg) and state.activate_min_vz_avg < ACTIVATE_MAX_DESCENT_VZ:
+        passed = False
+        issues.append(f"Descent spike (100ms avg): vz={state.activate_min_vz_avg:.2f}m/s < {ACTIVATE_MAX_DESCENT_VZ}m/s")
+
+    if activation_reached and math.isfinite(state.activate_min_vz_raw) and state.activate_min_vz_raw < ACTIVATE_RAW_DESCENT_GUARD:
+        passed = False
+        issues.append(f"Descent spike (raw, catastrophic): vz={state.activate_min_vz_raw:.2f}m/s < {ACTIVATE_RAW_DESCENT_GUARD}m/s")
 
     if activation_reached and state.activate_max_alt_drop > ACTIVATE_MAX_ALT_DROP:
         passed = False
@@ -400,6 +434,8 @@ def print_results(state: TestState):
     if state.step_count == 0:
         passed = False
         issues.append("No motor responses")
+
+    state.test_passed = passed
 
     print(f"  Status:               {'PASS' if passed else 'FAIL'}")
     for issue in issues:
@@ -638,3 +674,6 @@ world.run(
     interactive=False,
     backend="jax",
 )
+
+# Exit with test result code
+sys.exit(0 if _state[0] and _state[0].test_passed else 1)

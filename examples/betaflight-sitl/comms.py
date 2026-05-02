@@ -720,14 +720,29 @@ class BetaflightSyncBridge:
             packet = ServoPacket.from_bytes(data)
             self._last_motors = packet.motor_speed.copy()
             self._step_count += 1
+            self._consecutive_timeouts = 0  # reset on success
             return self._last_motors
 
         except socket.timeout:
-            # Return last known motors on timeout (first few steps may timeout
-            # before Betaflight is fully initialized)
+            self._consecutive_timeouts = getattr(self, '_consecutive_timeouts', 0) + 1
+
+            # During initialization (step_count == 0), allow some timeouts
             if self._step_count == 0:
-                # During initialization, just return zeros
+                # But fail hard if SITL never responds after many attempts
+                if self._consecutive_timeouts > 50:
+                    raise TimeoutError(
+                        f"Betaflight SITL never responded after {self._consecutive_timeouts} attempts. "
+                        f"SITL may have died or failed to bind ports."
+                    )
                 return np.zeros(4)
+
+            # After initialization, fail hard after 10 consecutive timeouts
+            # (single timeout is normal during BF task scheduling jitter)
+            if self._consecutive_timeouts > 10:
+                raise TimeoutError(
+                    f"Betaflight SITL stopped responding: {self._consecutive_timeouts} consecutive timeouts "
+                    f"after {self._step_count} successful steps. SITL may have crashed."
+                )
             raise TimeoutError(
                 f"No motor response from Betaflight within {self._current_timeout_ms:.0f}ms "
                 f"(step {self._step_count})"

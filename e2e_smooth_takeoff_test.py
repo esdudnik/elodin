@@ -164,6 +164,7 @@ class TestState:
 
     last_print_time: float = -1.0
     results_printed: bool = False
+    test_passed: bool = False
 
     def transition(self, new_phase: Phase, t: float):
         old = self.phase.name
@@ -406,6 +407,8 @@ def print_results(state: TestState):
         passed = False
         issues.append("No motor responses")
 
+    state.test_passed = passed
+
     print(f"  Status:               {'PASS' if passed else 'FAIL'}")
     for issue in issues:
         prefix = "FAIL" if not passed else "INFO"
@@ -645,3 +648,6 @@ world.run(
     interactive=False,
     backend="jax",
 )
+
+# Exit with test result code
+sys.exit(0 if _state[0] and _state[0].test_passed else 1)

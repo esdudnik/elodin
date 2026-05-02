@@ -107,8 +107,8 @@ POSHOLD_SETTLE_TIMEOUT = 10.0   # seconds — max wait for settle
 HOLD_DURATION = 10.0            # seconds to measure hold quality
 HOLD_RADIUS_TOLERANCE = 2.0     # meters — max XY drift from capture point
 HOLD_SPEED_TOLERANCE = 0.5      # m/s — max horizontal speed during hold
-MOVE_DURATION = 5.0             # seconds of stick override
-MOVE_ROLL = 1300                # stronger left bank (POSHOLD fights back, need more authority)
+MOVE_DURATION = 8.0             # seconds of stick override
+MOVE_ROLL = 1200                # stronger left bank (POSHOLD fights back, need more authority)
 MOVE_SETTLE_VXY = 0.3           # m/s — must decay below this after move
 MOVE_SETTLE_DWELL = 1.0         # seconds — vxy must stay below threshold
 MOVE_SETTLE_TIMEOUT = 10.0      # seconds — max wait for braking
@@ -237,6 +237,7 @@ class TestState:
     # Diagnostics
     last_print_time: float = -1.0
     results_printed: bool = False
+    test_passed: bool = False
     quat_xyzw: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0, 1.0]))
     gyro_body: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
@@ -732,7 +733,11 @@ def print_results(state: TestState):
 
     if state.step_count == 0:
         passed = False
+
         issues.append("No motor responses from Betaflight")
+
+    state.test_passed = passed
+
 
     if passed and not issues:
         print("  Status:               PASS")
@@ -1018,3 +1023,6 @@ world.run(
     interactive=use_interactive,
     backend="jax",
 )
+
+# Exit with test result code
+sys.exit(0 if _state[0] and _state[0].test_passed else 1)

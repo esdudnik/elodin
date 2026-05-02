@@ -155,6 +155,7 @@ class TestState:
 
     last_print_time: float = -1.0
     results_printed: bool = False
+    test_passed: bool = False
     quat_xyzw: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0, 1.0]))
     gyro_body: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
@@ -415,7 +416,11 @@ def print_results(state: TestState):
 
     if state.step_count == 0:
         passed = False
+
         issues.append("No motor responses")
+
+    state.test_passed = passed
+
 
     if passed:
         print("  Status:               PASS")
@@ -664,3 +669,6 @@ world.run(
     interactive=False,
     backend="jax",
 )
+
+# Exit with test result code
+sys.exit(0 if _state[0] and _state[0].test_passed else 1)
