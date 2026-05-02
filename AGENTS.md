@@ -66,12 +66,55 @@ install-elodin                 # Build everything (Python SDK + binaries)
 ### Using run.sh
 
 ```bash
-./run.sh build-bf         # Clean + build betaflight SITL .elf
-./run.sh rebuild-elodin   # Rebuild elodin Python SDK + editor binary
-./run.sh run              # Run editor with betaflight-sitl example (skip rebuild)
-./run.sh all              # build-bf + rebuild-elodin + run (default)
-./run.sh check            # Analyze log file at /tmp/bf-elodin.log
+./run.sh build-bf                        # Clean + build betaflight SITL .elf
+./run.sh rebuild-elodin                  # Rebuild elodin Python SDK + editor binary
+./run.sh run                             # Run editor with betaflight-sitl example (skip rebuild)
+./run.sh all                             # build-bf + rebuild-elodin + run (default)
+./run.sh check                           # Analyze log file at /tmp/bf-elodin.log
+
+# Single E2E tests (production physics: baseline IGE gates)
+./run.sh e2e-ground-idle                 # ground-idle regression test
+./run.sh e2e-failsafe-althold            # failsafe descent landing test
+./run.sh e2e-all                         # 11-test regression suite (~25 min)
+# (and many more — see ./run.sh with no args)
+
+# Diagnostic physics profiles (since 2026-05-01)
+./run.sh e2e-strict    [N|--runs=N]      # focused suite under "strict" IGE profile (partial gate)
+./run.sh e2e-realistic [N|--runs=N]      # focused suite under "realistic" IGE profile (no gate, matches real HW)
 ```
+
+The `e2e-strict` and `e2e-realistic` targets set `E2E_PHYSICS_PROFILE` and run
+the focused subset (`ground-idle`, `nosettle-takeoff`, `failsafe-althold`,
+`failsafe-init`, `midair-activation`) — used to expose IGE-related controller
+or mixer issues that would otherwise be hidden by the `baseline` thrust gate.
+Severity ordering: `baseline` < `strict` < `realistic`.
+See `sim_world.md` for the physics-profile reference table.
+
+### E2E command cheat-sheet (which command for which goal)
+
+| What you want | Command | Tests run | Profile | Cycles | Approx duration |
+|---|---|---|---|---|---|
+| Smoke test (focused, single cycle) | `./run.sh e2e-realistic` | Focused 5 | realistic | 1 | ~8 min |
+| Confidence run (focused, multi-cycle) | `./run.sh e2e-realistic --runs=5` | Focused 5 | realistic | 5 (= 25 runs) | ~40 min |
+| Stricter-than-baseline regression pressure | `./run.sh e2e-strict --runs=5` | Focused 5 | strict | 5 | ~40 min |
+| Baseline regression (default CI gate) | `./run.sh e2e-all` | All 11 | baseline | 1 | ~25 min |
+| All 11 tests under realistic (no built-in target) | `E2E_PHYSICS_PROFILE=realistic ./run.sh e2e-all` | All 11 | realistic | 1 | ~25 min |
+| All 11, multi-run, realistic (manual loop) | `for i in 1 2 3 4 5; do E2E_PHYSICS_PROFILE=realistic ./run.sh e2e-all; done` | All 11 | realistic | 5 (= 55 runs) | ~2h |
+| Single individual test, default profile | `./run.sh e2e-ground-idle` (or any other `e2e-*` name) | 1 | baseline (default) | 1 | ~1-3 min |
+| Single individual test under realistic | `E2E_PHYSICS_PROFILE=realistic ./run.sh e2e-ground-idle` | 1 | realistic | 1 | ~1-3 min |
+
+**Focused 5 vs All 11:**
+- **Focused 5** (IGE-sensitive): `ground-idle`, `nosettle-takeoff`, `failsafe-althold`, `failsafe-init`, `midair-activation` — exercise near-ground / failsafe paths where IGE matters.
+- **All 11** (`e2e-all` set): focused 5 + `smooth-takeoff`, `center-semantics`, `angle-althold`, `acro-althold`, `flight`, `poshold` — extra 6 are in-flight or non-IGE behavior; running them under `realistic` adds time without adding diagnostic value (per `strict_test.md`).
+
+**Env-var trick:** `E2E_PHYSICS_PROFILE=name ./run.sh <target>` sets the profile for that one invocation only. Variable doesn't persist in your shell after the command finishes. Useful for ad-hoc combinations not covered by the dedicated targets.
+
+**What the runner reports** (since Step 1.5, 2026-05-02): both `e2e-all` and `e2e-strict`/`e2e-realistic` summaries include `Pass / Ctrl-fail / Infra-fail` three-column counts, `Effective pass rate` excluding infra failures, per-test result lines tagged `PASS`/`FAIL`/`INFRA`, an `Infra-fail reasons:` section with causes (`ports-still-held`, `sitl-died-during-test`, `startup-timeout`, etc.), and a three-state return code (0/1/2).
+
+**Logs:**
+- Single test: `/tmp/bf-e2e-<test>.log`
+- `e2e-all` suite: `/tmp/bf-e2e-e2e-<test>.log` (note the doubled `e2e` from how `e2e-all` builds names)
+- Focused suite per-run: `/tmp/bf-e2e-<profile>-<test>-r<N>.log`
 
 `rebuild-elodin` requires `nix develop` shell. `build-bf` and `run` do not.
 

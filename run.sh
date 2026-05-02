@@ -219,13 +219,127 @@ do_run() {
         "$ELODIN_BIN" editor "$EXAMPLE" 2>&1 | tee "$LOG_FILE"
 }
 
+# ── Test result codes returned by run_single_e2e ──
+#   0 = PASS
+#   1 = CONTROLLER_FAIL (BF behaved wrongly, test ran)
+#   2 = INFRA_FAIL (BF/SITL didn't start cleanly or crashed; not the controller's fault)
+RC_PASS=0
+RC_CONTROLLER_FAIL=1
+RC_INFRA_FAIL=2
+
+# Set by run_single_e2e to the human-readable infra-fail reason whenever it
+# returns RC_INFRA_FAIL. Cleared at the start of each call. Callers append
+# this to their per-test summary line for at-a-glance diagnosis.
+LAST_INFRA_REASON=""
+
+# ── Wait for BF SITL ports to be free ──
+# Returns 0 if all ports free within timeout, 1 otherwise.
+# On timeout, prints which ports are still held and by which PIDs.
+# Args: $1 = timeout in seconds (default 10)
+wait_ports_free() {
+    local timeout_s="${1:-10}"
+    local ports=(5761 9001 9002 9003 9004 2240)
+    local start; start=$(date +%s)
+    while true; do
+        local held=()
+        local p
+        for p in "${ports[@]}"; do
+            local pids
+            pids=$(lsof -ti :$p 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+            [ -n "$pids" ] && held+=("$p(pids=$pids)")
+        done
+        [ ${#held[@]} -eq 0 ] && return 0
+        local now; now=$(date +%s)
+        if [ $((now - start)) -ge $timeout_s ]; then
+            echo -e "  ${RED}✗ Ports still held after ${timeout_s}s: ${held[*]}${NC}"
+            return 1
+        fi
+        sleep 0.5
+    done
+}
+
+# ── Post-launch infra-fail detection (polling) ──
+# Used after BF launch + boot grace, before the Python test starts. Polls for
+# up to N seconds because BF may take a moment to start writing logs.
+# Args: $1=log file, $2=BF PID, $3=poll timeout in seconds (default 5)
+# Echoes a reason string if infra-fail; empty if BF appears healthy and ready.
+detect_infra_fail_startup() {
+    local log="$1" bf_pid="$2" poll_timeout="${3:-5}"
+    local start; start=$(date +%s)
+    while true; do
+        local alive=0
+        kill -0 "$bf_pid" 2>/dev/null && alive=1
+
+        # Fatal signature in log (regardless of alive/dead)
+        if [ -s "$log" ]; then
+            local matched
+            matched=$(grep -m1 -E 'bind port .* failed|Segmentation fault|Trace/BPT trap|Bus error' "$log" 2>/dev/null)
+            if [ -n "$matched" ]; then
+                echo "fatal-init-signature: $matched"
+                return 0
+            fi
+        fi
+
+        # SITL dead
+        if [ $alive -eq 0 ]; then
+            if [ ! -s "$log" ]; then echo "sitl-died-no-output"
+            else echo "sitl-exited-during-startup"
+            fi
+            return 0
+        fi
+
+        # SITL alive + log has content → ready, no infra-fail
+        if [ -s "$log" ]; then
+            echo ""
+            return 0
+        fi
+
+        # SITL alive + zero-byte log: poll until timeout
+        local now; now=$(date +%s)
+        if [ $((now - start)) -ge $poll_timeout ]; then
+            echo "startup-timeout"
+            return 0
+        fi
+        sleep 0.2
+    done
+}
+
+# ── Post-test infra-fail detection (single check) ──
+# Used after the Python test exits non-zero, to distinguish controller-fail
+# from "SITL crashed mid-test". Conservative: only flags hard infra signs
+# (fatal signature OR dead PID). "Alive + silent + no fatal" → controller fail.
+# Args: $1=log file, $2=BF PID
+# Echoes reason if infra-fail; empty if test exit should be attributed to controller.
+detect_infra_fail_posttest() {
+    local log="$1" bf_pid="$2"
+    if [ -s "$log" ]; then
+        local matched
+        matched=$(grep -m1 -E 'bind port .* failed|Segmentation fault|Trace/BPT trap|Bus error' "$log" 2>/dev/null)
+        if [ -n "$matched" ]; then
+            echo "fatal-init-signature: $matched"
+            return 0
+        fi
+    fi
+    if ! kill -0 "$bf_pid" 2>/dev/null; then
+        if [ ! -s "$log" ]; then echo "sitl-dead-no-output"
+        else echo "sitl-died-during-test"
+        fi
+        return 0
+    fi
+    echo ""
+}
+
 # ── Headless E2E runner (single test) ──
 # Extracted from do_e2e headless path. Used by both individual e2e-* commands
-# and do_e2e_all(). Returns test exit code (0=pass, non-zero=fail).
+# and do_e2e_all(). Returns one of:
+#   $RC_PASS (0)             — test passed
+#   $RC_CONTROLLER_FAIL (1)  — test ran, BF/test reported failure
+#   $RC_INFRA_FAIL (2)       — BF SITL didn't start cleanly or crashed; not a controller fault
 run_single_e2e() {
     local test_script="$1"
     local test_name="$2"
     local log_file="/tmp/bf-e2e-${test_name}.log"
+    LAST_INFRA_REASON=""   # cleared per call; set before any RC_INFRA_FAIL return
 
     # Verify test script exists
     if [ ! -f "$test_script" ]; then
@@ -257,12 +371,19 @@ run_single_e2e() {
     pkill -f betaflight_SITL 2>/dev/null || true
     # Kill any lingering elodin-db / Python test processes holding port 2240
     lsof -ti :2240 2>/dev/null | xargs kill -9 2>/dev/null || true
-    sleep 1
     # Force kill any remaining BF
     pkill -9 -f betaflight_SITL 2>/dev/null || true
-    sleep 0.5
     # Clean up ALL stale elodin test DB directories
     rm -rf e2e_*_db e2e_*_test_db /tmp/e2e_*_db 2>/dev/null || true
+
+    # Active port-readiness wait (replaces bare sleep). If ports are still
+    # held after timeout, classify as INFRA_FAIL — port collision is an
+    # infrastructure issue, not a controller bug.
+    if ! wait_ports_free 10; then
+        LAST_INFRA_REASON="ports-still-held"
+        echo -e "  ${RED}✗ INFRA_FAIL: ports-still-held${NC}"
+        return $RC_INFRA_FAIL
+    fi
 
     echo -e "\n${GREEN}▶ Running E2E test (headless): $test_name${NC}"
     echo -e "  Script: $test_script"
@@ -285,13 +406,17 @@ run_single_e2e() {
     trap _e2e_cleanup RETURN
 
     echo -e "  Betaflight SITL started (PID $bf_pid) from $BETAFLIGHT_DIR"
-    sleep 2  # wait for UDP port binding (needs extra time in suite mode)
+    sleep 2  # boot grace — wait for UDP port binding before infra check
 
-    # Fix 1: Verify SITL PID is alive before running test
-    if ! kill -0 "$bf_pid" 2>/dev/null; then
-        echo -e "  ${RED}✗ Betaflight SITL died during startup (PID $bf_pid)${NC}"
+    # Startup infra-fail detection (polls up to 5s for log content / fatal sig / death)
+    local startup_reason
+    startup_reason=$(detect_infra_fail_startup "$log_file" "$bf_pid" 5)
+    if [ -n "$startup_reason" ]; then
+        LAST_INFRA_REASON="$startup_reason"
+        echo -e "  ${RED}✗ INFRA_FAIL during startup: ${startup_reason}${NC}"
         trap - RETURN
-        return 1
+        _e2e_cleanup
+        return $RC_INFRA_FAIL
     fi
 
     # Run test — capture exit code without triggering set -e
@@ -299,11 +424,28 @@ run_single_e2e() {
     PYTHONUNBUFFERED=1 \
         python3 "$test_script" run --no-s10 2>&1 | tee -a "$log_file" || test_exit=$?
 
+    # Post-test infra-fail detection: if test failed, scan the log for fatal
+    # signatures + check PID liveness before attributing to the controller.
+    # SITL crashes mid-test would otherwise look like controller failures.
+    if [ $test_exit -ne 0 ]; then
+        local posttest_reason
+        posttest_reason=$(detect_infra_fail_posttest "$log_file" "$bf_pid")
+        if [ -n "$posttest_reason" ]; then
+            LAST_INFRA_REASON="$posttest_reason"
+            echo -e "  ${YELLOW}⚠ INFRA_FAIL during test: ${posttest_reason}${NC}"
+            trap - RETURN
+            _e2e_cleanup
+            return $RC_INFRA_FAIL
+        fi
+    fi
+
     # Clear trap before normal cleanup
     trap - RETURN
     _e2e_cleanup
 
-    return $test_exit
+    # test_exit is 0 (PASS) or non-zero (CONTROLLER_FAIL).
+    # Map non-zero to RC_CONTROLLER_FAIL for clarity at the call site.
+    [ $test_exit -eq 0 ] && return $RC_PASS || return $RC_CONTROLLER_FAIL
 }
 
 # ── Focused suite for strict/full physics profile investigations ──
@@ -328,7 +470,14 @@ parse_runs() {
 }
 
 # Run focused suite under a given E2E_PHYSICS_PROFILE for N runs.
-# Tracks per-test pass/fail counts across runs and prints a summary.
+# Tracks per-test pass / controller-fail / infra-fail counts and prints a
+# three-column summary. Effective pass rate excludes infra-fails so the
+# number reflects controller behavior, not infrastructure noise.
+#
+# Return codes:
+#   0 — all runs passed
+#   1 — at least one controller failure
+#   2 — infra-only failures (no controller failures)
 do_focused_suite() {
     local profile="$1"
     local runs
@@ -339,17 +488,26 @@ do_focused_suite() {
     local total_tests=${#FOCUSED_TESTS[@]}
     local total_runs=$((runs * total_tests))
     local total_passed=0
-    local total_failed=0
+    local total_ctrl_fail=0
+    local total_infra=0
 
-    # Per-test pass counters (parallel arrays — bash 3.2 compat, no associative arrays)
+    # Per-test counters (parallel arrays — bash 3.2 compat, no associative arrays)
     local test_names=()
     local test_passes=()
-    local test_fails=()
+    local test_ctrl_fails=()
+    local test_infra_fails=()
     for entry in "${FOCUSED_TESTS[@]}"; do
         test_names+=("${entry%%:*}")
         test_passes+=(0)
-        test_fails+=(0)
+        test_ctrl_fails+=(0)
+        test_infra_fails+=(0)
     done
+
+    # Track each infra-fail occurrence as "<name> r<run_idx>: <reason>" for
+    # display after the breakdown table. Lets the reader diagnose the failure
+    # mode (ports-still-held, sitl-died-during-test, etc.) without scrolling
+    # back through the full run output.
+    local infra_reasons=()
 
     local suite_start
     suite_start=$(date +%s)
@@ -372,15 +530,22 @@ do_focused_suite() {
             echo -e "\n━━━ [run $run_idx] $name ━━━"
 
             local rc=0
-            if run_single_e2e "$script" "${profile}-${name}-r${run_idx}"; then
-                rc=0
-                test_passes[$i]=$((${test_passes[$i]} + 1))
-                total_passed=$((total_passed + 1))
-            else
-                rc=$?
-                test_fails[$i]=$((${test_fails[$i]} + 1))
-                total_failed=$((total_failed + 1))
-            fi
+            run_single_e2e "$script" "${profile}-${name}-r${run_idx}" || rc=$?
+            case $rc in
+                0)  # RC_PASS
+                    test_passes[$i]=$((${test_passes[$i]} + 1))
+                    total_passed=$((total_passed + 1))
+                    ;;
+                2)  # RC_INFRA_FAIL
+                    test_infra_fails[$i]=$((${test_infra_fails[$i]} + 1))
+                    total_infra=$((total_infra + 1))
+                    infra_reasons+=("${name} r${run_idx}: ${LAST_INFRA_REASON:-unknown}")
+                    ;;
+                *)  # RC_CONTROLLER_FAIL or any other non-zero
+                    test_ctrl_fails[$i]=$((${test_ctrl_fails[$i]} + 1))
+                    total_ctrl_fail=$((total_ctrl_fail + 1))
+                    ;;
+            esac
             i=$((i + 1))
         done
     done
@@ -391,25 +556,48 @@ do_focused_suite() {
     local suite_min=$((suite_duration / 60))
     local suite_sec=$((suite_duration % 60))
 
+    # Effective pass rate excludes infra failures (they're not the controller's fault)
+    local effective_total=$((total_passed + total_ctrl_fail))
+
     echo ""
     echo "========================================================================"
     echo "  FOCUSED SUITE RESULTS — profile=$profile  runs=$runs"
     echo "========================================================================"
-    echo "  Total: $total_runs  Passed: $total_passed  Failed: $total_failed  Duration: ${suite_min}m ${suite_sec}s"
+    echo "  Total runs: $total_runs  Pass: $total_passed  Ctrl-fail: $total_ctrl_fail  Infra-fail: $total_infra  Duration: ${suite_min}m ${suite_sec}s"
+    if [ $effective_total -gt 0 ]; then
+        echo "  Effective pass rate: $total_passed/$effective_total (excludes infra failures)"
+    else
+        echo "  Effective pass rate: n/a (all runs were infra-fails)"
+    fi
     echo ""
-    echo "  Per-test pass rates (across $runs runs):"
+    echo "  Per-test breakdown (across $runs runs):"
+    printf "    %-22s  %-9s  %-11s  %-11s\n" "test" "pass" "ctrl-fail" "infra-fail"
     local i=0
     for name in "${test_names[@]}"; do
         local p="${test_passes[$i]}"
-        local f="${test_fails[$i]}"
-        printf "    %-22s  %d/%d pass  (%d fail)\n" "$name" "$p" "$runs" "$f"
+        local cf="${test_ctrl_fails[$i]}"
+        local inf="${test_infra_fails[$i]}"
+        printf "    %-22s  %d/%d      %d/%d        %d/%d\n" "$name" "$p" "$runs" "$cf" "$runs" "$inf" "$runs"
         i=$((i + 1))
     done
+    if [ ${#infra_reasons[@]} -gt 0 ]; then
+        echo ""
+        echo "  Infra-fail reasons:"
+        local r
+        for r in "${infra_reasons[@]}"; do
+            echo "    $r"
+        done
+    fi
+
     echo ""
     echo "  Per-run logs: /tmp/bf-e2e-${profile}-<test>-r<N>.log"
     echo "========================================================================"
 
-    [ $total_failed -eq 0 ] && return 0 || return 1
+    # Three-state return: 0 = all pass, 1 = any controller fail, 2 = infra-only failures
+    if [ $total_ctrl_fail -gt 0 ]; then return 1
+    elif [ $total_infra -gt 0 ]; then return 2
+    else                              return 0
+    fi
 }
 
 # ── Run all automated E2E tests sequentially ──
@@ -430,7 +618,8 @@ do_e2e_all() {
 
     local total=${#tests[@]}
     local passed=0
-    local failed=0
+    local ctrl_failed=0
+    local infra_failed=0
     local results=()
     local suite_start
     suite_start=$(date +%s)
@@ -452,23 +641,28 @@ do_e2e_all() {
 
         # Guarded execution — no set -e cascade
         local rc=0
-        if run_single_e2e "$script" "$name"; then
-            rc=0
-        else
-            rc=$?
-        fi
+        run_single_e2e "$script" "$name" || rc=$?
 
         local test_end
         test_end=$(date +%s)
         local duration=$((test_end - test_start))
 
-        if [ $rc -eq 0 ]; then
-            passed=$((passed + 1))
-            results+=("  PASS  ${duration}s  $name")
-        else
-            failed=$((failed + 1))
-            results+=("  FAIL  ${duration}s  $name  (log: /tmp/bf-e2e-${name}.log)")
-        fi
+        # Three-state classification: PASS / CONTROLLER_FAIL / INFRA_FAIL
+        case $rc in
+            0)  # RC_PASS
+                passed=$((passed + 1))
+                results+=("  PASS   ${duration}s  $name")
+                ;;
+            2)  # RC_INFRA_FAIL — SITL didn't start cleanly or crashed
+                infra_failed=$((infra_failed + 1))
+                local reason="${LAST_INFRA_REASON:-unknown}"
+                results+=("  INFRA  ${duration}s  $name  [${reason}]  (log: /tmp/bf-e2e-${name}.log)")
+                ;;
+            *)  # RC_CONTROLLER_FAIL or any other non-zero
+                ctrl_failed=$((ctrl_failed + 1))
+                results+=("  FAIL   ${duration}s  $name  (log: /tmp/bf-e2e-${name}.log)")
+                ;;
+        esac
     done
 
     local suite_end
@@ -477,18 +671,30 @@ do_e2e_all() {
     local suite_min=$((suite_duration / 60))
     local suite_sec=$((suite_duration % 60))
 
+    # Effective pass rate excludes infra failures (not the controller's fault)
+    local effective_total=$((passed + ctrl_failed))
+
     echo ""
     echo "========================================================================"
     echo "  E2E TEST SUITE RESULTS"
     echo "========================================================================"
-    echo "  Total: $total  Passed: $passed  Failed: $failed  Duration: ${suite_min}m ${suite_sec}s"
+    echo "  Total: $total  Passed: $passed  Ctrl-fail: $ctrl_failed  Infra-fail: $infra_failed  Duration: ${suite_min}m ${suite_sec}s"
+    if [ $effective_total -gt 0 ]; then
+        echo "  Effective pass rate: $passed/$effective_total (excludes infra failures)"
+    else
+        echo "  Effective pass rate: n/a (all runs were infra-fails)"
+    fi
     echo ""
     for r in "${results[@]}"; do
         echo "$r"
     done
     echo "========================================================================"
 
-    [ $failed -eq 0 ] && return 0 || return 1
+    # Three-state return: 0 = all pass, 1 = any controller fail, 2 = infra-only failures
+    if   [ $ctrl_failed -gt 0 ];  then return 1
+    elif [ $infra_failed -gt 0 ]; then return 2
+    else                               return 0
+    fi
 }
 
 do_e2e() {
@@ -650,8 +856,8 @@ case "$MODE" in
     e2e-strict)
         do_focused_suite strict "${2:-1}"
         ;;
-    e2e-full)
-        do_focused_suite full "${2:-1}"
+    e2e-realistic)
+        do_focused_suite realistic "${2:-1}"
         ;;
     check)
         do_check_logs
@@ -675,7 +881,7 @@ case "$MODE" in
         echo "  e2e-poshold               - position hold test"
         echo "  e2e-*-editor              - any test above with 3D viewport (e.g. e2e-angle-althold-editor)"
         echo "  e2e-strict [N|--runs=N]   - focused suite under strict physics profile, N runs"
-        echo "  e2e-full   [N|--runs=N]   - focused suite under full physics profile (no thrust gate), N runs"
+        echo "  e2e-realistic [N|--runs=N]   - focused suite under realistic physics profile (no thrust gate, matches real hardware), N runs"
         echo "  all                       - build-bf + rebuild-elodin + run (default)"
         echo "  check                     - analyze log file at $LOG_FILE"
         exit 1

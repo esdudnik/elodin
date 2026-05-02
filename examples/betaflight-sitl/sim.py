@@ -190,9 +190,9 @@ def create_rotor_aero_system(config: DroneConfig):
         # --- Per-rotor IGE thrust gain ---
         # Transform each motor position to world frame, compute per-rotor AGL.
         # Gates are profile-driven (config.physics_profile):
-        #   baseline: thrust gate 0.65→1.0, AGL gate 0.03→0.08m — CI-stable.
-        #   strict:   thrust gate 0.3→0.6,  AGL gate 0.01→0.03m — long-term regression pressure.
-        #   full:     no thrust gate (always 1.0), AGL gate 0.01→0.03m — diagnostic profile.
+        #   baseline:  thrust gate 0.65→1.0, AGL gate 0.03→0.08m — CI-stable.
+        #   strict:    thrust gate 0.3→0.6,  AGL gate 0.01→0.03m — long-term regression pressure.
+        #   realistic: no thrust gate (always 1.0), AGL gate 0.01→0.03m — matches real hardware physics.
         def ige_per_motor(i, modified_thrust):
             pt_body = motor_positions[i]
             pt_world = pos.linear() + quat @ pt_body

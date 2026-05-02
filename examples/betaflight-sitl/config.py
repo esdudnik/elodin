@@ -202,10 +202,11 @@ class DroneConfig:
     ige_max_gain: float = 0.15            # max 15% thrust efficiency increase at ground level
 
     # Physics profile for IGE gating. Selectable via E2E_PHYSICS_PROFILE env var.
-    #   baseline: current gates (thrust 0.65→1.0, AGL 0.03→0.08m). CI default, regression gate.
-    #   strict:   reduced thrust gate (0.3→0.6), tightened AGL (0.01→0.03m). Long-term regression pressure.
-    #   full:     no thrust gate at all, AGL 0.01→0.03m. Diagnostic profile that guarantees real-physics
-    #             "floating" failures reproduce. Used for controller investigation, not CI.
+    # Severity progression baseline → strict → realistic (each one stricter than the previous):
+    #   baseline:  current gates (thrust 0.65→1.0, AGL 0.03→0.08m). CI default, regression gate.
+    #   strict:    reduced thrust gate (0.3→0.6), tightened AGL (0.01→0.03m). Long-term regression pressure.
+    #   realistic: no thrust gate at all, AGL 0.01→0.03m. Matches real-hardware physics; guarantees
+    #              real-physics "floating" failures reproduce. Used for controller investigation, not CI.
     # Other physics (VRS, wake turbulence, baro bias) are unchanged across profiles.
     physics_profile: str = field(
         default_factory=lambda: os.environ.get("E2E_PHYSICS_PROFILE", "baseline")
@@ -375,11 +376,11 @@ class DroneConfig:
     def ige_thrust_gate(self) -> Optional[tuple[float, float]]:
         """
         IGE thrust-fraction smoothstep gate as (low, high), or None for no gate.
-        None means thrust gate is always 1.0 (full IGE regardless of thrust).
+        None means thrust gate is always 1.0 (IGE active regardless of thrust).
         """
         if self.physics_profile == "strict":
             return (0.3, 0.6)
-        if self.physics_profile == "full":
+        if self.physics_profile == "realistic":
             return None
         return (0.65, 1.0)  # baseline
 
@@ -389,7 +390,7 @@ class DroneConfig:
         IGE AGL smoothstep gate as (low, high) in meters. Always present —
         the AGL gate protects the contact zone and is physically meaningful.
         """
-        if self.physics_profile in ("strict", "full"):
+        if self.physics_profile in ("strict", "realistic"):
             return (0.01, 0.03)
         return (0.03, 0.08)  # baseline
 
