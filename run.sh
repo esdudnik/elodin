@@ -369,8 +369,25 @@ run_single_e2e() {
 
     # Kill stale processes from previous test
     pkill -f betaflight_SITL 2>/dev/null || true
-    # Kill any lingering elodin-db / Python test processes holding port 2240
-    lsof -ti :2240 2>/dev/null | xargs kill -9 2>/dev/null || true
+    # Kill any lingering elodin-db / Python test processes holding port 2240,
+    # but ONLY if the holder is recognizably ours. Avoid SIGKILL-ing unrelated
+    # tools that happen to also use port 2240 (elodin-db's default port).
+    local pid
+    for pid in $(lsof -ti :2240 2>/dev/null); do
+        local comm
+        comm=$(ps -p "$pid" -o comm= 2>/dev/null | tr -d ' ')
+        case "$comm" in
+            *elodin*|*python*|*betaflight*)
+                kill -9 "$pid" 2>/dev/null || true
+                ;;
+            "")
+                # Process already gone — nothing to do
+                ;;
+            *)
+                echo -e "  ${YELLOW}⚠ Port 2240 held by unrelated process pid=$pid comm=$comm — NOT killing${NC}"
+                ;;
+        esac
+    done
     # Force kill any remaining BF
     pkill -9 -f betaflight_SITL 2>/dev/null || true
     # Clean up ALL stale elodin test DB directories
@@ -448,7 +465,7 @@ run_single_e2e() {
     [ $test_exit -eq 0 ] && return $RC_PASS || return $RC_CONTROLLER_FAIL
 }
 
-# ── Focused suite for strict/full physics profile investigations ──
+# ── Focused suite for strict/realistic physics profile investigations ──
 # Used to reproduce real-hardware "floating" behavior under realistic IGE.
 # Tests are the ones strict_test.md identified as IGE-sensitive.
 FOCUSED_TESTS=(
