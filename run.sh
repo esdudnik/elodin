@@ -28,6 +28,7 @@ E2E_GROUND_IDLE_SCRIPT="$REPO_ROOT/e2e_ground_idle_test.py"
 E2E_CENTER_SCRIPT="$REPO_ROOT/e2e_center_semantics_test.py"
 E2E_MIDAIR_SCRIPT="$REPO_ROOT/e2e_midair_activation_test.py"
 E2E_SMOOTH_TAKEOFF_SCRIPT="$REPO_ROOT/e2e_smooth_takeoff_test.py"
+E2E_MANUAL_LANDING_SAFETY_SCRIPT="$REPO_ROOT/e2e_manual_landing_safety_test.py"
 BETAFLIGHT_DIR="$REPO_ROOT/../betaflight"
 LOG_FILE="/tmp/bf-elodin.log"
 E2E_LOG_FILE="/tmp/bf-e2e.log"
@@ -227,10 +228,25 @@ RC_PASS=0
 RC_CONTROLLER_FAIL=1
 RC_INFRA_FAIL=2
 
-# Set by run_single_e2e to the human-readable infra-fail reason whenever it
-# returns RC_INFRA_FAIL. Cleared at the start of each call. Callers append
-# this to their per-test summary line for at-a-glance diagnosis.
+# Set by run_single_e2e_inner to the human-readable infra-fail reason whenever
+# it returns RC_INFRA_FAIL. Cleared at the start of each call. The retry
+# wrapper (run_single_e2e) saves the first-attempt reason to
+# LAST_INFRA_REASON_FIRST before retrying, so callers can see both.
 LAST_INFRA_REASON=""
+LAST_INFRA_REASON_FIRST=""
+
+# Set by run_single_e2e_inner to the BF SITL PID it started. Used by the
+# retry wrapper as primary cleanup target (fallback: pattern kill).
+LAST_BF_PID=""
+
+# ── Suite stability thresholds ──
+# First-attempt infra rate above this in a multi-run suite triggers
+# "⚠ SUITE UNSTABLE" header. Tunable as suite execution stabilises.
+SUITE_INFRA_THRESHOLD_PCT=5
+# Single test with first-attempt infra count >= this in same suite triggers
+# "⚠ FLAKY" tag — investigate as a deterministic test-specific issue, not
+# random startup race.
+TEST_FLAKY_THRESHOLD=2
 
 # ── Wait for BF SITL ports to be free ──
 # Returns 0 if all ports free within timeout, 1 otherwise.
@@ -329,17 +345,20 @@ detect_infra_fail_posttest() {
     echo ""
 }
 
-# ── Headless E2E runner (single test) ──
-# Extracted from do_e2e headless path. Used by both individual e2e-* commands
-# and do_e2e_all(). Returns one of:
+# ── Headless E2E runner (single test, single attempt — no retry) ──
+# Use run_single_e2e (the wrapper) instead unless you specifically need to
+# bypass retry. Returns one of:
 #   $RC_PASS (0)             — test passed
 #   $RC_CONTROLLER_FAIL (1)  — test ran, BF/test reported failure
-#   $RC_INFRA_FAIL (2)       — BF SITL didn't start cleanly or crashed; not a controller fault
-run_single_e2e() {
+#   $RC_INFRA_FAIL (2)       — BF SITL didn't start cleanly or crashed
+# Sets LAST_INFRA_REASON on infra-fail. Sets LAST_BF_PID to the BF process
+# it spawned (so wrapper can target-kill before retry).
+run_single_e2e_inner() {
     local test_script="$1"
     local test_name="$2"
     local log_file="/tmp/bf-e2e-${test_name}.log"
     LAST_INFRA_REASON=""   # cleared per call; set before any RC_INFRA_FAIL return
+    LAST_BF_PID=""         # cleared per call; set after SITL spawn
 
     # Verify test script exists
     if [ ! -f "$test_script" ]; then
@@ -411,6 +430,7 @@ run_single_e2e() {
     local bf_pid=""
     (cd "$BETAFLIGHT_DIR" && exec "$elf") > "$log_file" 2>&1 &
     bf_pid=$!
+    LAST_BF_PID="$bf_pid"   # exposed for retry wrapper's targeted cleanup
 
     # Trap-based cleanup: guarantee SITL is killed on any exit from this function
     _e2e_cleanup() {
@@ -465,6 +485,71 @@ run_single_e2e() {
     [ $test_exit -eq 0 ] && return $RC_PASS || return $RC_CONTROLLER_FAIL
 }
 
+# ── Headless E2E runner (single test, with infra-fail retry) ──
+# Wrapper around run_single_e2e_inner that retries ONCE on specific startup-
+# race signatures (sitl-died-no-output, sitl-exited-during-startup,
+# startup-timeout). Other infra reasons (ports-still-held, fatal-init-
+# signature, mid-test crashes) are NOT retried — they're either deterministic
+# or indicate deeper issues worth investigating.
+#
+# Controller-fails are NEVER retried.
+#
+# Set E2E_NO_RETRY=1 to disable retry (useful when investigating).
+#
+# Sets LAST_INFRA_REASON_FIRST to the first-attempt reason (always).
+# Sets LAST_INFRA_REASON to the second-attempt reason if retry was triggered
+# and still infra-failed (otherwise the value from the successful attempt or
+# the first attempt's reason if no retry was triggered).
+#
+# Retry uses a separate log file: /tmp/bf-e2e-<test_name>-attempt2.log
+# (attempt 1 log preserved for inspection).
+run_single_e2e() {
+    local test_script="$1"
+    local test_name="$2"
+    LAST_INFRA_REASON_FIRST=""
+
+    local rc=0
+    run_single_e2e_inner "$test_script" "$test_name" || rc=$?
+
+    if [ $rc -ne $RC_INFRA_FAIL ]; then
+        return $rc   # PASS or CONTROLLER_FAIL — never retry
+    fi
+
+    LAST_INFRA_REASON_FIRST="$LAST_INFRA_REASON"
+    local first_reason="$LAST_INFRA_REASON"
+
+    # Only retry on startup-race signatures
+    case "$first_reason" in
+        sitl-died-no-output*|sitl-exited-during-startup*|startup-timeout*)
+            ;;
+        *)
+            echo -e "  ${YELLOW}⚠ INFRA (${first_reason}) — not retry-eligible${NC}"
+            return $RC_INFRA_FAIL
+            ;;
+    esac
+
+    # Escape hatch for diagnostics
+    if [ "${E2E_NO_RETRY:-0}" = "1" ]; then
+        echo -e "  ${YELLOW}⚠ INFRA (${first_reason}); retry disabled by E2E_NO_RETRY${NC}"
+        return $RC_INFRA_FAIL
+    fi
+
+    echo -e "  ${YELLOW}⚠ INFRA on attempt 1 (${first_reason}); aggressive cleanup + attempt 2${NC}"
+
+    # Targeted PID kill first (idempotent — trap-cleanup already ran in inner),
+    # then pattern kill as fallback for any leaked processes.
+    if [ -n "$LAST_BF_PID" ]; then
+        kill -9 "$LAST_BF_PID" 2>/dev/null || true
+    fi
+    pkill -9 -f betaflight_SITL 2>/dev/null || true
+    sleep 5
+
+    # Attempt 2 — separate log file so attempt 1 is preserved for inspection
+    local rc2=0
+    run_single_e2e_inner "$test_script" "${test_name}-attempt2" || rc2=$?
+    return $rc2
+}
+
 # ── Focused suite for strict/realistic physics profile investigations ──
 # Used to reproduce real-hardware "floating" behavior under realistic IGE.
 # Tests are the ones strict_test.md identified as IGE-sensitive.
@@ -506,24 +591,28 @@ do_focused_suite() {
     local total_runs=$((runs * total_tests))
     local total_passed=0
     local total_ctrl_fail=0
-    local total_infra=0
+    local total_infra_final=0       # final classification (after retry)
+    local total_infra_first=0       # first-attempt infra (always counted, transparent)
+    local total_recovered=0         # retried and succeeded (no longer infra)
 
-    # Per-test counters (parallel arrays — bash 3.2 compat, no associative arrays)
+    # Per-test counters. Counters bucket by BASE test name (not -attempt2),
+    # so retry preserves test identity in aggregation.
     local test_names=()
     local test_passes=()
     local test_ctrl_fails=()
-    local test_infra_fails=()
+    local test_infra_first=()       # first-attempt infra per test
+    local test_infra_final=()       # final infra (after retry) per test
     for entry in "${FOCUSED_TESTS[@]}"; do
         test_names+=("${entry%%:*}")
         test_passes+=(0)
         test_ctrl_fails+=(0)
-        test_infra_fails+=(0)
+        test_infra_first+=(0)
+        test_infra_final+=(0)
     done
 
-    # Track each infra-fail occurrence as "<name> r<run_idx>: <reason>" for
-    # display after the breakdown table. Lets the reader diagnose the failure
-    # mode (ports-still-held, sitl-died-during-test, etc.) without scrolling
-    # back through the full run output.
+    # Per-incident records. Records BOTH first and second reasons when retry
+    # was triggered, so reader can distinguish transient race vs deterministic
+    # crash (where same signature reappears) vs different failure modes.
     local infra_reasons=()
 
     local suite_start
@@ -548,19 +637,56 @@ do_focused_suite() {
 
             local rc=0
             run_single_e2e "$script" "${profile}-${name}-r${run_idx}" || rc=$?
+
+            # Did wrapper trigger a retry? Yes if LAST_INFRA_REASON_FIRST set.
+            local was_retried=0
+            if [ -n "$LAST_INFRA_REASON_FIRST" ]; then
+                was_retried=1
+                # Also: even non-retry-eligible infras populate FIRST. To avoid
+                # false retry-counted, only count as retried if reason was eligible.
+                case "$LAST_INFRA_REASON_FIRST" in
+                    sitl-died-no-output*|sitl-exited-during-startup*|startup-timeout*) ;;
+                    *) was_retried=0 ;;
+                esac
+                if [ "${E2E_NO_RETRY:-0}" = "1" ]; then
+                    was_retried=0
+                fi
+                # Always count first-attempt infra
+                total_infra_first=$((total_infra_first + 1))
+                test_infra_first[$i]=$((${test_infra_first[$i]} + 1))
+            fi
+
             case $rc in
-                0)  # RC_PASS
+                0)  # RC_PASS — possibly recovered by retry
                     test_passes[$i]=$((${test_passes[$i]} + 1))
                     total_passed=$((total_passed + 1))
+                    if [ $was_retried -eq 1 ]; then
+                        total_recovered=$((total_recovered + 1))
+                        infra_reasons+=("${name} r${run_idx}: ${LAST_INFRA_REASON_FIRST} → [recovered after retry]")
+                    fi
                     ;;
-                2)  # RC_INFRA_FAIL
-                    test_infra_fails[$i]=$((${test_infra_fails[$i]} + 1))
-                    total_infra=$((total_infra + 1))
-                    infra_reasons+=("${name} r${run_idx}: ${LAST_INFRA_REASON:-unknown}")
+                2)  # RC_INFRA_FAIL — final
+                    test_infra_final[$i]=$((${test_infra_final[$i]} + 1))
+                    total_infra_final=$((total_infra_final + 1))
+                    if [ $was_retried -eq 1 ]; then
+                        infra_reasons+=("${name} r${run_idx}: ${LAST_INFRA_REASON_FIRST} → STILL INFRA after retry: ${LAST_INFRA_REASON}")
+                    else
+                        # First-attempt infra not yet counted (no retry triggered)
+                        if [ -z "$LAST_INFRA_REASON_FIRST" ]; then
+                            total_infra_first=$((total_infra_first + 1))
+                            test_infra_first[$i]=$((${test_infra_first[$i]} + 1))
+                        fi
+                        infra_reasons+=("${name} r${run_idx}: ${LAST_INFRA_REASON:-unknown} [not retry-eligible]")
+                    fi
                     ;;
                 *)  # RC_CONTROLLER_FAIL or any other non-zero
                     test_ctrl_fails[$i]=$((${test_ctrl_fails[$i]} + 1))
                     total_ctrl_fail=$((total_ctrl_fail + 1))
+                    if [ $was_retried -eq 1 ]; then
+                        # Recovered to controller-fail (rare but possible)
+                        total_recovered=$((total_recovered + 1))
+                        infra_reasons+=("${name} r${run_idx}: ${LAST_INFRA_REASON_FIRST} → ctrl-fail after retry")
+                    fi
                     ;;
             esac
             i=$((i + 1))
@@ -573,33 +699,52 @@ do_focused_suite() {
     local suite_min=$((suite_duration / 60))
     local suite_sec=$((suite_duration % 60))
 
-    # Effective pass rate excludes infra failures (they're not the controller's fault)
+    # Effective pass rate excludes FINAL infra failures (the controller-meaningful denominator)
     local effective_total=$((total_passed + total_ctrl_fail))
+
+    # Stability assessment: first-attempt infra rate
+    local first_infra_pct=0
+    if [ $total_runs -gt 0 ]; then
+        first_infra_pct=$(( (total_infra_first * 100) / total_runs ))
+    fi
 
     echo ""
     echo "========================================================================"
     echo "  FOCUSED SUITE RESULTS — profile=$profile  runs=$runs"
     echo "========================================================================"
-    echo "  Total runs: $total_runs  Pass: $total_passed  Ctrl-fail: $total_ctrl_fail  Infra-fail: $total_infra  Duration: ${suite_min}m ${suite_sec}s"
+    echo "  Total runs: $total_runs  Pass: $total_passed  Ctrl-fail: $total_ctrl_fail  Infra-fail (final): $total_infra_final  Duration: ${suite_min}m ${suite_sec}s"
+    echo "  First-attempt infra: $total_infra_first (${first_infra_pct}%) — $total_recovered recovered by retry, $total_infra_final still infra after retry"
     if [ $effective_total -gt 0 ]; then
-        echo "  Effective pass rate: $total_passed/$effective_total (excludes infra failures)"
+        echo "  Effective pass rate: $total_passed/$effective_total (excludes final infra failures)"
     else
         echo "  Effective pass rate: n/a (all runs were infra-fails)"
     fi
+
+    if [ $first_infra_pct -gt $SUITE_INFRA_THRESHOLD_PCT ]; then
+        echo ""
+        echo "  ${YELLOW}⚠ SUITE UNSTABLE — first-attempt infra rate ${first_infra_pct}% > ${SUITE_INFRA_THRESHOLD_PCT}% threshold${NC}"
+    fi
+
     echo ""
     echo "  Per-test breakdown (across $runs runs):"
-    printf "    %-22s  %-9s  %-11s  %-11s\n" "test" "pass" "ctrl-fail" "infra-fail"
+    printf "    %-22s  %-7s  %-9s  %-11s  %-13s  %s\n" "test" "pass" "ctrl-fail" "infra (1st)" "infra (final)" "flag"
     local i=0
     for name in "${test_names[@]}"; do
         local p="${test_passes[$i]}"
         local cf="${test_ctrl_fails[$i]}"
-        local inf="${test_infra_fails[$i]}"
-        printf "    %-22s  %d/%d      %d/%d        %d/%d\n" "$name" "$p" "$runs" "$cf" "$runs" "$inf" "$runs"
+        local infra1="${test_infra_first[$i]}"
+        local infraF="${test_infra_final[$i]}"
+        local flag=""
+        if [ $infra1 -ge $TEST_FLAKY_THRESHOLD ]; then
+            flag="⚠ FLAKY"
+        fi
+        printf "    %-22s  %d/%d    %d/%d      %d/%d         %d/%d           %s\n" "$name" "$p" "$runs" "$cf" "$runs" "$infra1" "$runs" "$infraF" "$runs" "$flag"
         i=$((i + 1))
     done
+
     if [ ${#infra_reasons[@]} -gt 0 ]; then
         echo ""
-        echo "  Infra-fail reasons:"
+        echo "  Infra-fail reasons (first attempt → retry outcome):"
         local r
         for r in "${infra_reasons[@]}"; do
             echo "    $r"
@@ -607,13 +752,15 @@ do_focused_suite() {
     fi
 
     echo ""
-    echo "  Per-run logs: /tmp/bf-e2e-${profile}-<test>-r<N>.log"
+    echo "  Per-run logs:"
+    echo "    Attempt 1: /tmp/bf-e2e-${profile}-<test>-r<N>.log"
+    echo "    Attempt 2: /tmp/bf-e2e-${profile}-<test>-r<N>-attempt2.log (only if retried)"
     echo "========================================================================"
 
     # Three-state return: 0 = all pass, 1 = any controller fail, 2 = infra-only failures
     if [ $total_ctrl_fail -gt 0 ]; then return 1
-    elif [ $total_infra -gt 0 ]; then return 2
-    else                              return 0
+    elif [ $total_infra_final -gt 0 ]; then return 2
+    else                                    return 0
     fi
 }
 
@@ -636,7 +783,9 @@ do_e2e_all() {
     local total=${#tests[@]}
     local passed=0
     local ctrl_failed=0
-    local infra_failed=0
+    local infra_final=0      # final classification (after retry)
+    local infra_first=0      # first-attempt infra (transparent)
+    local recovered=0        # retried and no longer infra
     local results=()
     local suite_start
     suite_start=$(date +%s)
@@ -664,20 +813,48 @@ do_e2e_all() {
         test_end=$(date +%s)
         local duration=$((test_end - test_start))
 
+        # Was retry triggered? Yes if LAST_INFRA_REASON_FIRST set AND eligible
+        # AND retry not disabled.
+        local was_retried=0
+        if [ -n "$LAST_INFRA_REASON_FIRST" ]; then
+            case "$LAST_INFRA_REASON_FIRST" in
+                sitl-died-no-output*|sitl-exited-during-startup*|startup-timeout*) was_retried=1 ;;
+            esac
+            if [ "${E2E_NO_RETRY:-0}" = "1" ]; then
+                was_retried=0
+            fi
+            infra_first=$((infra_first + 1))
+        fi
+
         # Three-state classification: PASS / CONTROLLER_FAIL / INFRA_FAIL
         case $rc in
             0)  # RC_PASS
                 passed=$((passed + 1))
-                results+=("  PASS   ${duration}s  $name")
+                if [ $was_retried -eq 1 ]; then
+                    recovered=$((recovered + 1))
+                    results+=("  PASS   ${duration}s  $name  [recovered: ${LAST_INFRA_REASON_FIRST}]")
+                else
+                    results+=("  PASS   ${duration}s  $name")
+                fi
                 ;;
             2)  # RC_INFRA_FAIL — SITL didn't start cleanly or crashed
-                infra_failed=$((infra_failed + 1))
-                local reason="${LAST_INFRA_REASON:-unknown}"
-                results+=("  INFRA  ${duration}s  $name  [${reason}]  (log: /tmp/bf-e2e-${name}.log)")
+                infra_final=$((infra_final + 1))
+                if [ -z "$LAST_INFRA_REASON_FIRST" ]; then
+                    # Not retry-eligible (or counted via infra_first already if was_retried set)
+                    infra_first=$((infra_first + 1))
+                    results+=("  INFRA  ${duration}s  $name  [${LAST_INFRA_REASON:-unknown}]  (log: /tmp/bf-e2e-${name}.log)")
+                else
+                    results+=("  INFRA  ${duration}s  $name  [${LAST_INFRA_REASON_FIRST} → STILL INFRA: ${LAST_INFRA_REASON}]  (logs: /tmp/bf-e2e-${name}.log + ${name}-attempt2.log)")
+                fi
                 ;;
             *)  # RC_CONTROLLER_FAIL or any other non-zero
                 ctrl_failed=$((ctrl_failed + 1))
-                results+=("  FAIL   ${duration}s  $name  (log: /tmp/bf-e2e-${name}.log)")
+                if [ $was_retried -eq 1 ]; then
+                    recovered=$((recovered + 1))
+                    results+=("  FAIL   ${duration}s  $name  [retried after ${LAST_INFRA_REASON_FIRST}]  (log: /tmp/bf-e2e-${name}.log)")
+                else
+                    results+=("  FAIL   ${duration}s  $name  (log: /tmp/bf-e2e-${name}.log)")
+                fi
                 ;;
         esac
     done
@@ -688,19 +865,31 @@ do_e2e_all() {
     local suite_min=$((suite_duration / 60))
     local suite_sec=$((suite_duration % 60))
 
-    # Effective pass rate excludes infra failures (not the controller's fault)
+    # Effective pass rate excludes FINAL infra failures
     local effective_total=$((passed + ctrl_failed))
+    # Stability: first-attempt infra rate
+    local first_infra_pct=0
+    if [ $total -gt 0 ]; then
+        first_infra_pct=$(( (infra_first * 100) / total ))
+    fi
 
     echo ""
     echo "========================================================================"
     echo "  E2E TEST SUITE RESULTS"
     echo "========================================================================"
-    echo "  Total: $total  Passed: $passed  Ctrl-fail: $ctrl_failed  Infra-fail: $infra_failed  Duration: ${suite_min}m ${suite_sec}s"
+    echo "  Total: $total  Passed: $passed  Ctrl-fail: $ctrl_failed  Infra-fail (final): $infra_final  Duration: ${suite_min}m ${suite_sec}s"
+    echo "  First-attempt infra: $infra_first (${first_infra_pct}%) — $recovered recovered by retry, $infra_final still infra after retry"
     if [ $effective_total -gt 0 ]; then
-        echo "  Effective pass rate: $passed/$effective_total (excludes infra failures)"
+        echo "  Effective pass rate: $passed/$effective_total (excludes final infra failures)"
     else
         echo "  Effective pass rate: n/a (all runs were infra-fails)"
     fi
+
+    if [ $first_infra_pct -gt $SUITE_INFRA_THRESHOLD_PCT ]; then
+        echo ""
+        echo "  ${YELLOW}⚠ SUITE UNSTABLE — first-attempt infra rate ${first_infra_pct}% > ${SUITE_INFRA_THRESHOLD_PCT}% threshold${NC}"
+    fi
+
     echo ""
     for r in "${results[@]}"; do
         echo "$r"
@@ -709,8 +898,8 @@ do_e2e_all() {
 
     # Three-state return: 0 = all pass, 1 = any controller fail, 2 = infra-only failures
     if   [ $ctrl_failed -gt 0 ];  then return 1
-    elif [ $infra_failed -gt 0 ]; then return 2
-    else                               return 0
+    elif [ $infra_final -gt 0 ];  then return 2
+    else                                return 0
     fi
 }
 
@@ -870,6 +1059,9 @@ case "$MODE" in
     e2e-smooth-takeoff)
         run_single_e2e "$E2E_SMOOTH_TAKEOFF_SCRIPT" "smooth-takeoff"
         ;;
+    e2e-manual-landing-safety)
+        run_single_e2e "$E2E_MANUAL_LANDING_SAFETY_SCRIPT" "manual-landing-safety"
+        ;;
     e2e-strict)
         do_focused_suite strict "${2:-1}"
         ;;
@@ -887,6 +1079,7 @@ case "$MODE" in
         echo "  e2e-all                   - run ALL automated E2E tests sequentially"
         echo "  e2e-ground-idle           - ground idle regression test"
         echo "  e2e-smooth-takeoff        - smooth takeoff ramp test"
+        echo "  e2e-manual-landing-safety - manual touchdown anti-regression (low-pass + commit-land)"
         echo "  e2e-center-semantics      - center-stick semantics test"
         echo "  e2e-nosettle-takeoff      - no-settle takeoff FSM test"
         echo "  e2e-angle-althold         - ANGLE+ALTHOLD flight cycle test"
