@@ -2,20 +2,60 @@
 
 ## Goal
 
-Automated end-to-end testing of Betaflight's ALT_HOLD flight mode using the Elodin simulation platform. Betaflight SITL runs the full flight controller, Elodin runs physics simulation, communication via UDP lockstep at 1kHz.
+Automated end-to-end testing of Betaflight's iNav-style ALT_HOLD flight mode using
+the Elodin simulation platform. Betaflight SITL runs the full flight controller,
+Elodin runs physics simulation, communication via UDP lockstep at 1 kHz.
 
-## Current Status (2026-03-27): PASSING
+## Current Status (2026-05-06): 100% controller-clean across 105 sequential runs
 
+| Suite | Profile | Runs | Pass | Ctrl-fail | Final infra |
+|---|---|---|---|---|---|
+| `e2e-all --runs=5` | baseline | 55 | 51 | **0** | 4 (SITL flake) |
+| `e2e-realistic --runs=10` | realistic | 50 | 45 | **0** | 5 (SITL flake) |
+| **Combined** | — | **105** | **96** | **0** | **9 (~9%)** |
+
+Effective pass rate excluding infra: 96/96 = 100%. Hardware validation pending.
+
+## Test Suite (12 tests, 11 automated + 1 manual)
+
+| # | Test | File | Command | What it validates |
+|---|------|------|---------|-------------------|
+| 1 | Ground idle | `e2e_ground_idle_test.py` | `./run.sh e2e-ground-idle` | No moon-takeoff at idle stick |
+| 2 | Smooth takeoff | `e2e_smooth_takeoff_test.py` | `./run.sh e2e-smooth-takeoff` | Liftoff only above center+deadband |
+| 3 | Center semantics | `e2e_center_semantics_test.py` | `./run.sh e2e-center-semantics` | Below-mid no climb, hold, descent |
+| 4 | No-settle takeoff | `e2e_nosettle_takeoff_test.py` | `./run.sh e2e-nosettle-takeoff` | Climb without throttle settling |
+| 5 | ANGLE+ALTHOLD | `e2e_angle_althold_test.py` | `./run.sh e2e-angle-althold` | Full flight cycle with self-leveling |
+| 6 | ACRO+ALTHOLD | `e2e_acro_althold_test.py` | `./run.sh e2e-acro-althold` | Altitude hold without ANGLE |
+| 7 | Horizontal flight | `e2e_flight_test.py` | `./run.sh e2e-flight` | Lateral maneuvers + altitude hold |
+| 8 | Failsafe ALTHOLD | `e2e_failsafe_althold_test.py` | `./run.sh e2e-failsafe-althold` | BOXFAILSAFE landing from hover |
+| 9 | Failsafe init | `e2e_failsafe_initialize_test.py` | `./run.sh e2e-failsafe-init` | Failsafe from INITIALIZE state |
+| 10 | Mid-air activation | `e2e_midair_activation_test.py` | `./run.sh e2e-midair-activation` | Safe activation at low stick mid-flight |
+| 11 | POSHOLD | `e2e_poshold_test.py` | `./run.sh e2e-poshold` | Position hold with virtual mag |
+| 12 | Manual landing safety | `e2e_manual_landing_safety_test.py` | `./run.sh e2e-manual-landing-safety` | Low-pass + commit-land anti-regression |
+| — | Throttle curve (manual) | `e2e_throttle_curve_test.py` | `python3 e2e_throttle_curve_test.py run --no-s10` | Curve-aware midpoint with thr_mid=30 |
+
+All tests support `[N|--runs=N]` for multi-run with per-run logs:
+```bash
+./run.sh e2e-midair-activation --runs=10
+./run.sh e2e-all --runs=5     # 11 tests × 5 cycles = 55 runs
 ```
-  Target altitude:      7m
-  Max altitude:         7.0m
-  Hover target:         6.9m
-  Hover max drift:      0.5m       (within 1.0m tolerance)
-  Hover avg altitude:   6.6m
-  Landing altitude:     0.02m      (contact-based disarm)
-  Landing velocity:     0.00m/s
-  Sim speed:            0.9x realtime
-  Status:               PASS
+
+## Physics Profiles
+
+Selectable via `E2E_PHYSICS_PROFILE` env (default `baseline`):
+
+| Profile | IGE thrust gate | IGE AGL gate | Use case |
+|---|---|---|---|
+| `baseline` | smoothstep 0.65→1.0 | smoothstep 0.03→0.08 m | CI default, regression gate |
+| `strict` | smoothstep 0.3→0.6 | smoothstep 0.01→0.03 m | Long-term regression pressure |
+| `realistic` | **none** (always 1.0) | smoothstep 0.01→0.03 m | Matches real-hardware physics |
+
+Severity ordering: `baseline` < `strict` < `realistic`.
+
+**Focused suites** (5 IGE-sensitive tests: ground-idle, nosettle-takeoff, failsafe-althold, failsafe-init, midair-activation):
+```bash
+./run.sh e2e-strict    [N|--runs=N]
+./run.sh e2e-realistic [N|--runs=N]
 ```
 
 ## Build & Run
@@ -23,10 +63,10 @@ Automated end-to-end testing of Betaflight's ALT_HOLD flight mode using the Elod
 ### Build Betaflight SITL
 ```bash
 cd betaflight/
-make arm_sdk_install        # first time only
-make TARGET=SITL            # incremental build
-# or
-make TARGET=SITL clean && make TARGET=SITL   # full rebuild
+make arm_sdk_install                                       # first time only
+make TARGET=SITL                                           # incremental
+make TARGET=SITL clean && make TARGET=SITL                 # full rebuild
+make TARGET=SITL OPTIONS="DEBUG_ALTHOLD_TRACE"             # diagnostic traces
 ```
 
 ### Build Elodin (requires nix)
@@ -34,135 +74,150 @@ make TARGET=SITL clean && make TARGET=SITL   # full rebuild
 cd elodin/
 nix develop
 source $NIX_SHELLRC
-./run.sh rebuild-elodin     # builds Python SDK + editor binary
+./run.sh rebuild-elodin
 ```
 
-### Run E2E Test
+### Run a single test
 ```bash
 cd elodin/
-./run.sh e2e-althold 2>&1 | tee /tmp/bf-e2e-all.log       # headless
-./run.sh e2e-althold-editor 2>&1 | tee /tmp/bf-e2e-all.log # with 3D viewport
+./run.sh e2e-ground-idle                                                  # baseline, 1 run
+./run.sh e2e-ground-idle --runs=10                                        # baseline, 10 runs
+E2E_PHYSICS_PROFILE=realistic ./run.sh e2e-midair-activation --runs=10    # realistic, 10 runs
+```
+
+### Run full suite
+```bash
+./run.sh e2e-all                                          # 11 tests, baseline, 1 cycle (~25 min)
+./run.sh e2e-all --runs=5                                 # 11 tests × 5 cycles = 55 runs (~125 min)
+E2E_PHYSICS_PROFILE=realistic ./run.sh e2e-all            # 11 tests under realistic
+./run.sh e2e-realistic --runs=10                          # focused 5 × 10 = 50 runs (~100 min)
+```
+
+### Editor mode (3D viewport)
+Append `-editor` to any single-test command:
+```bash
+./run.sh e2e-angle-althold-editor
+./run.sh e2e-poshold-editor
 ```
 
 ## Eeprom Configuration
 
-Required before first run. Settings persist in `betaflight/eeprom.bin` across rebuilds. Delete to reset.
+Settings persist in `betaflight/eeprom.bin` across rebuilds. Delete to reset.
 
-```bash
-# Terminal 1: Start SITL
-cd betaflight/ && ./obj/main/betaflight_SITL.elf
+```
+Terminal 1: cd betaflight/ && ./obj/main/betaflight_SITL.elf
+Terminal 2: socat PTY,link=/tmp/bf-cli,rawer TCP:127.0.0.1:5761 &
+            screen /tmp/bf-cli
+            (type # then Enter)
+```
 
-# Terminal 2: Connect CLI
-socat -,rawer TCP:127.0.0.1:5761
-# Type # then Enter, then:
-
-set small_angle = 180
+**DEFAULT (GPS+baro + failsafe + POSHOLD)** — standard config for all tests:
+```
 set acc_calibration = 0,0,0,1
-set ap_hover_throttle = 1130
 set failsafe_delay = 200
-set d_pitch = 0
-set d_roll = 0
+set ap_hover_throttle = 1130
+set d_pitch = 5
+set d_roll = 5
+set failsafe_switch_mode = STAGE2
+set failsafe_procedure = AUTO-LAND
+set pos_hold_without_mag = ON
 aux 0 0 0 1700 2100 0 0
 aux 1 1 1 1700 2100 0 0
 aux 2 3 2 1700 2100 0 0
+aux 3 27 3 1700 2100 0 0
+aux 4 11 4 1700 2100 0 0
 save
 ```
 
-**Aux channel mapping:**
-```
-aux <index> <permanentId> <auxChannelIndex> <start> <end> <logic> <linkedTo>
-
-aux 0  0  0  1700 2100 0 0   ->  BOXARM      on AUX1 (rcData[4])
-aux 1  1  1  1700 2100 0 0   ->  BOXANGLE    on AUX2 (rcData[5])
-aux 2  3  2  1700 2100 0 0   ->  BOXALTHOLD  on AUX3 (rcData[6])
-```
+**Aux mapping**: AUX1=ARM, AUX2=ANGLE, AUX3=ALTHOLD, AUX4=BOXFAILSAFE, AUX5=BOXPOSHOLD.
 
 **Notes:**
-- `d_pitch=0` and `d_roll=0` required for SITL (D-term causes liftoff oscillation)
-- Use `socat -,rawer` for CLI (screen/PTY method may hang)
-- Type `exit` to leave CLI (reboots SITL)
+- Do NOT use Betaflight Configurator — auto-dump crashes 4.6 SITL on macOS
+- `socat -,rawer` may hang — use the PTY+screen pattern above
+- Type `exit` or `Ctrl+D` to leave CLI (reboots SITL)
+- Check `aux`, `get d_roll`, `get ap_hover_throttle` to verify
 
-## Test Phases
+## Runner Behavior (`run.sh`)
 
-```
-Phase            Throttle  ARM   ANGLE  ALTHOLD   Transition Condition
-----------------------------------------------------------------------
-BOOT             1000      off   off    off       5s elapsed (gyro cal)
-ARM              1000      ON    ON     off       2s elapsed
-ENABLE_ALTHOLD   1000      ON    ON     ON        2s elapsed (takeoff prep)
-SETTLE           1500      ON    ON     ON        1s (enables stick adjust)
-CLIMB            1700      ON    ON     ON        altitude >= 5.5m
-TOP_APPROACH     1600      ON    ON     ON        altitude >= 6.8m AND |vz| < 0.2 for 0.5s
-HOVER            1500      ON    ON     ON        10s elapsed
-DESCEND          1300      ON    ON     ON        altitude <= 2m (or 60s)
-APPROACH         1380      ON    ON     ON        altitude <= 0.5m
-LAND             1380      ON    ON     ON        contact-based: alt < 0.1m AND |vz| < 0.2 for 0.5s
-DISARM           1000      off   off    off       1s elapsed
-DONE             --        --    --     --        print results
-```
+### Three-state classification
+Each test run returns one of:
+- **PASS** (RC 0) — test passed
+- **CONTROLLER_FAIL** (RC 1) — controller produced a wrong outcome
+- **INFRA_FAIL** (RC 2) — SITL didn't start cleanly or crashed
 
-**Key phase details:**
-- **TOP_APPROACH**: Slow climb (throttle 1600, above deadband) lets BF estimator converge before hover. This is a harness mitigation for estimator lag, not an estimator fix.
-- **LAND**: Contact-based disarm replaces simple altitude threshold. Requires low altitude AND low velocity held for 0.5s.
-- **LOW_HOVER**: Removed — ground effect is disabled, so near-ground hold is not meaningful yet. Will return with sim realism package.
+### Retry-once on infra startup races
+Infra fails matching these signatures get one retry:
+- `sitl-died-no-output`
+- `sitl-exited-during-startup`
+- `startup-timeout`
+- `sitl-alive-but-unresponsive` / `sitl-unresponsive`
+- `fatal-init-signature: bind port`* (TIME_WAIT slip-through)
+
+Other fatal signatures (Segmentation fault, Bus error, Trace/BPT trap) are
+hard fails — never silently retried.
+
+### Port hardening
+`wait_ports_free` probes both `lsof` (for live PIDs) and `netstat -an -p tcp`
+(for kernel-held TIME_WAIT entries on TCP ports). 30 s default timeout
+accommodates macOS TIME_WAIT (2×MSL = 30 s).
+
+### Multi-run logs
+- Single run: `/tmp/bf-e2e-<test>.log`
+- Multi-run with profile: `/tmp/bf-e2e-<profile>-<test>-r<N>.log`
+- Multi-run e2e-all: `/tmp/bf-e2e-<test>-r<N>.log`
+- Retry: `<basename>-attempt2.log`
+
+### Summary output
+Both `do_focused_suite` and `do_e2e_all` show three columns (pass / ctrl-fail /
+infra-final), effective pass rate excluding infra, per-test breakdown for
+multi-run, and an `Infra-fail reasons:` section. Three-state return code (0/1/2).
 
 ## ALT_HOLD Architecture
 
-### Controller (iNav-style cascaded)
-```
-RC stick -> [Stick Deadband +-50] -> [Sqrt Controller] -> Target velocity
-         -> [Acceleration Limiter (0.5G up, 0.8G down)]
-         -> [Velocity PID with back-calculation anti-windup]
-         -> [PT1 Filter 4Hz] -> hover_throttle + correction -> mixer
-```
+iNav-style cascaded controller (matches `navigation_multicopter.c`):
 
-### Altitude Estimator (position.c)
 ```
-Fast predictor (1kHz, PID loop):
-  accel -> rMat rotation -> earth-frame Z -> integrate velocity & altitude
-
-Slow corrector (~50Hz, TASK_ALTITUDE):
-  baro -> 1Hz LPF -> residual corrections to velocity, altitude & accel bias
-  Weights: est_w_z_baro_p=0.35, est_w_z_baro_v=0.35, est_w_acc_bias=0.01
-  + velocity residual decay when no baro data
+RC stick → [Stick Deadband ±50] → [Sqrt Controller] → Target velocity
+         → [Acceleration Limiter (0.5G up, 0.8G down)]
+         → [Velocity PID with Astrom back-calculation anti-windup]
+         → [PT1 Filter 4Hz] → hover_throttle + correction → mixer
 ```
 
-**Estimator lag:** ~0.6m during climb/descent transitions. Converges to near-zero residual over ~10s at steady state. This is why TOP_APPROACH exists.
+**Explicit FSM:** IDLE → INITIALIZE → IN_PROGRESS → EXITING
 
-## Key Code Changes
-
-### BOXALTHOLD Mode Activation (core.c)
-ALT_HOLD is activated via BF's standard mode system: `IS_RC_MODE_ACTIVE(BOXALTHOLD)`. Requires eeprom `aux 2 3 2 1700 2100 0 0` (permanentId=3). The arming safety check at core.c:330 prevents arming with ALTHOLD switch already on.
-
-### Altitude Estimator (position.c)
-Two-layer complementary filter ported from iNav. Key fix: removed `WAS_EVER_ARMED` gate that blocked velocity integration on first flight.
-
-### D-term Workaround
-BF's rate PID D-term (Kd=34) amplifies gyro transients at liftoff in the sim. The ground contact model creates a sudden gyro spike at ground-to-air transition. Setting `d_roll=0 d_pitch=0` eliminates the oscillation. Sim-specific workaround, not needed for real hardware.
-
-### Viewport Fix (libs/db/src/lib.rs)
-`ctx.truncate()` after warmup caused VTable rebuild with 0 fields, preventing 3D model updates. Fixed by skipping empty VTable commits.
+**Real-elapsed-time `dt`:** matches iNav's `US2S(deltaMicros)` — derived per-tick
+from `currentTimeUs`, fall back to nominal `1/ALTHOLD_TASK_RATE_HZ` on first call
+or >200 ms gaps. (Fix: 2026-05-06 — previous hardcoded 0.01 s was wrong against
+SITL's actual ~30 ms cadence, made limiter 3× too slow.)
 
 ## Debug Instrumentation
 
-All debug prints use `fprintf(stderr, ...)` because SITL stdout is buffered and lost when killed. **Warning:** heavy debug prints in the PID loop cause timing changes that affect test results.
+Compile-gated traces — enabled with `OPTIONS="DEBUG_ALTHOLD_TRACE"`:
 
-| Tag | File | Status | What It Shows |
-|-----|------|--------|--------------|
-| `[MIXER]` | mixer.c | **Active** (~1Hz) | Throttle before/after ALT_HOLD, mixRange, motor values |
-| `[PREDICT]` | position.c | Commented | Predictor: accel, velocity, altitude, dt |
-| `[ATTR]` | position.c | Commented | Attribution: cumulative pred/baro/decay velocity |
-| `[ALTHOLD]` | autopilot_multirotor.c | Commented | Controller: throttle, target/actual alt/vel, PID correction |
-| `[ATTITUDE]` | autopilot_multirotor.c | Commented | Attitude: roll/pitch, PID outputs, gyro rates |
-| `[PITCH]`/`[ROLL]` | pid.c | Commented | PID split: setAngle, curAngle, P/I/D/F/Sum |
+| Tag | Source | What it shows |
+|-----|--------|--------------|
+| `[ALT]` | `alt_hold_multirotor.c` | Tick counter, FSM state, RC values, target velocity, FSM dwell |
+| `[CTRL]` | `autopilot_multirotor.c` | Target alt, desired velocity, vz, integrator, correction, throttle |
+| `[LAND]` | `alt_hold_multirotor.c` | Landing detector reasons, vz/gyro gates, hold-ms |
+| `[MSTOP]` | `alt_hold_multirotor.c` + `mixer.c` | Motor-stop predicate inputs and decisions |
+| `[EST]` | `position.c` | Baro/GPS estimator: residuals, weights, fade |
+
+All use `fprintf(stderr, ...)` (SITL stdout is buffered and lost on kill).
+Production builds without the flag are bit-for-bit unaffected.
 
 ## Known Limitations
 
-1. **D-term disabled** — `d_roll=0 d_pitch=0` required for SITL
-2. **Ground effect zeroed** — baro_bias=0, force_std=0, torque_std=0 in config.py
-3. **Estimator lag** — BF altitude lags ~0.6m during transitions (converges at steady state). Hover target captures at ~6.25m when truth is ~6.9m; hover avg ~6.6m
-4. **Landing approach speed** — APPROACH->LAND at ~0.5m with vz~-0.73m/s. Touchdown is clean but flare would be more realistic
+1. **D-term at 5/5 in SITL** — full hardware values (30/34) destabilize liftoff in sim
+2. **Estimator lag** — BF altitude lags ~0.2-0.6 m during transitions, converges over ~5 s
+3. **Ground effect** — IGE/VRS/wake-turbulence model is intentionally less aggressive than worst real-hardware case (`baseline` profile); use `realistic` for harder pressure
+4. **SITL startup flakiness** — ~7-10% of runs hit `sitl-died-no-output` after retry. Pure infra issue, separate investigation
+5. **Stale eeprom** — accumulated config state causes regressions; always reset before baseline testing
 
-## Full Progress
+## References
 
-See `betaflight/progress.md` for complete bug fix timeline and future work priorities.
+- `betaflight/progress.md` — full development timeline (Sessions 1-14)
+- `inav_comparison.md` — iNav vs BF architecture comparison
+- `strict_test.md` — physics-profile design + investigation outcomes
+- `sim_world.md` — sim physics reference (rotor aero, contact, sensors)
+- `communication.md` — IPC architecture (UDP lockstep + s10)
+- `betaflight/help/changes.md` § 13 — iNav ALT_HOLD as a fork feature
