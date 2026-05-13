@@ -6,15 +6,20 @@ Automated end-to-end testing of Betaflight's iNav-style ALT_HOLD flight mode usi
 the Elodin simulation platform. Betaflight SITL runs the full flight controller,
 Elodin runs physics simulation, communication via UDP lockstep at 1 kHz.
 
-## Current Status (2026-05-06): 100% controller-clean across 105 sequential runs
+## Current Status (2026-05-13): 100% pass, 0 infra across post-mutex runs
+
+After the dyad thread-safety mutex landed (`a5cb52222` in betaflight, 2026-05-13),
+all categories of failure went to zero:
 
 | Suite | Profile | Runs | Pass | Ctrl-fail | Final infra |
 |---|---|---|---|---|---|
-| `e2e-all --runs=5` | baseline | 55 | 51 | **0** | 4 (SITL flake) |
-| `e2e-realistic --runs=10` | realistic | 50 | 45 | **0** | 5 (SITL flake) |
-| **Combined** | — | **105** | **96** | **0** | **9 (~9%)** |
+| `e2e-realistic --runs=10` (post-mutex) | realistic | 50 | **50** | **0** | **0** |
+| `e2e-all --runs=5` (post-mutex) | baseline | 55 | **55** | **0** | **0** |
+| **Combined post-mutex** | — | **105** | **105** | **0** | **0** |
+| **Cumulative all post-fix runs** | — | **260+** | — | **0** | resolved by Session 15 |
 
-Effective pass rate excluding infra: 96/96 = 100%. Hardware validation pending.
+Hardware validation pending. See `betaflight/progress.md` Session 14-15 for full
+context.
 
 ## Test Suite (12 tests, 11 automated + 1 manual)
 
