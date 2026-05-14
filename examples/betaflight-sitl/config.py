@@ -43,6 +43,33 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+# --- Valid profile values (used by env var validation) ---
+_VALID_PHYSICS_PROFILES = ("baseline", "strict", "realistic")
+_VALID_WIND_PROFILES = ("calm", "light", "moderate", "strong", "gusty")
+
+
+def _validated_physics_profile() -> str:
+    """Read E2E_PHYSICS_PROFILE from env, validate. Raises ValueError on invalid."""
+    value = os.environ.get("E2E_PHYSICS_PROFILE", "baseline")
+    if value not in _VALID_PHYSICS_PROFILES:
+        raise ValueError(
+            f"E2E_PHYSICS_PROFILE={value!r} is not valid. "
+            f"Expected one of: {_VALID_PHYSICS_PROFILES}"
+        )
+    return value
+
+
+def _validated_wind_profile() -> str:
+    """Read E2E_WIND_PROFILE from env, validate. Raises ValueError on invalid."""
+    value = os.environ.get("E2E_WIND_PROFILE", "calm")
+    if value not in _VALID_WIND_PROFILES:
+        raise ValueError(
+            f"E2E_WIND_PROFILE={value!r} is not valid. "
+            f"Expected one of: {_VALID_WIND_PROFILES}"
+        )
+    return value
+
+
 class _classproperty:
     """Descriptor that works like @property but on the class itself (Python 3.13+)."""
 
@@ -208,9 +235,22 @@ class DroneConfig:
     #   realistic: no thrust gate at all, AGL 0.01→0.03m. Matches real-hardware physics; guarantees
     #              real-physics "floating" failures reproduce. Used for controller investigation, not CI.
     # Other physics (VRS, wake turbulence, baro bias) are unchanged across profiles.
-    physics_profile: str = field(
-        default_factory=lambda: os.environ.get("E2E_PHYSICS_PROFILE", "baseline")
-    )
+    physics_profile: str = field(default_factory=_validated_physics_profile)
+
+    # Wind profile — orthogonal to physics_profile. Selectable via E2E_WIND_PROFILE env var.
+    # Defaults to `calm` (zero wind, full backward compatibility). Profiles model:
+    #   - Mean wind: steady horizontal force (currently +X direction only)
+    #   - Gust: Ornstein-Uhlenbeck noise added per-axis to mean; uncorrelated with wake_noise.
+    # Effect on physics: relative-air-velocity used in drag. Dramatic XY drift in flight,
+    # tilt-compensation makes ALTHOLD work harder to maintain altitude.
+    # Profiles (mean magnitude, gust std, gust correlation time):
+    #   calm:     (0, 0, 0),     std=0,   tau=any  — no wind, backward compat
+    #   light:    (2, 0, 0) m/s, std=0.5, tau=2.0s — light breeze (~1.5-2.5 m/s)
+    #   moderate: (4, 0, 0) m/s, std=1.0, tau=2.0s — typical windy day (~3-5 m/s)
+    #   strong:   (7, 0, 0) m/s, std=1.5, tau=1.5s — strong wind (~5.5-8.5 m/s)
+    #   gusty:    (3.5, 0, 0) m/s, std=1.5, tau=1.0s — gusty, 2-5 m/s with 1-2s variations
+    #             (matches hardware test where ALTHOLD struggled)
+    wind_profile: str = field(default_factory=_validated_wind_profile)
 
     # Propwash thrust loss on descent (VRS-like).
     # Descending into own wake reduces effective thrust. Bell-shaped loss profile:
@@ -393,6 +433,50 @@ class DroneConfig:
         if self.physics_profile in ("strict", "realistic"):
             return (0.01, 0.03)
         return (0.03, 0.08)  # baseline
+
+    @property
+    def wind_mean_world(self) -> NDArray[np.float64]:
+        """
+        Mean wind velocity in world frame (m/s). Currently constant direction +X
+        (eastward in ENU). Gust noise is added on top per-axis.
+        """
+        if self.wind_profile == "light":
+            return np.array([2.0, 0.0, 0.0])
+        if self.wind_profile == "moderate":
+            return np.array([4.0, 0.0, 0.0])
+        if self.wind_profile == "strong":
+            return np.array([7.0, 0.0, 0.0])
+        if self.wind_profile == "gusty":
+            return np.array([3.5, 0.0, 0.0])
+        return np.array([0.0, 0.0, 0.0])  # calm
+
+    @property
+    def wind_gust_std(self) -> float:
+        """
+        Standard deviation of gust component (m/s, per-axis). 0 means no gust.
+        Applied as Ornstein-Uhlenbeck noise process, uncorrelated across axes.
+        """
+        if self.wind_profile == "light":
+            return 0.5
+        if self.wind_profile == "moderate":
+            return 1.0
+        if self.wind_profile == "strong":
+            return 1.5
+        if self.wind_profile == "gusty":
+            return 1.5
+        return 0.0  # calm
+
+    @property
+    def wind_gust_tau(self) -> float:
+        """
+        Correlation time of gust OU process (seconds). Roughly the timescale
+        over which gust magnitude changes meaningfully.
+        """
+        if self.wind_profile == "strong":
+            return 1.5
+        if self.wind_profile == "gusty":
+            return 1.0   # 1s correlation → "every 1-2 seconds" variation
+        return 2.0       # light, moderate, calm (calm doesn't matter)
 
     @property
     def hover_throttle(self) -> float:

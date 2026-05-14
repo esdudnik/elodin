@@ -103,6 +103,20 @@ WakeNoise = ty.Annotated[
     ),
 ]
 
+# Wind gust noise state (Ornstein-Uhlenbeck process, 3D: vx,vy,vz in m/s).
+# This is the stochastic component of the wind that fluctuates over time.
+# Added to a constant `wind_mean_world` (from config) to form the total wind
+# vector used in drag computation. PRNG is independent from WakeNoise (split
+# from a per-tick base key) so the two noise streams are uncorrelated.
+WindNoise = ty.Annotated[
+    jax.Array,
+    el.Component(
+        "wind_noise",
+        el.ComponentType(el.PrimitiveType.F64, (3,)),
+        metadata={"element_names": "vx,vy,vz"},
+    ),
+]
+
 
 @dataclass
 class Drone(el.Archetype):
@@ -118,6 +132,7 @@ class Drone(el.Archetype):
     body_drag: BodyDrag = field(default_factory=lambda: jnp.zeros(3))
     sim_time: SimTime = field(default_factory=lambda: jnp.zeros(1))
     wake_noise: WakeNoise = field(default_factory=lambda: jnp.zeros(6))
+    wind_noise: WindNoise = field(default_factory=lambda: jnp.zeros(3))
 
 
 # --- Physics Systems ---
@@ -295,21 +310,26 @@ def create_drag_system(config: DroneConfig):
     """
     Create aerodynamic drag system.
 
-    Drag is modeled as quadratic:
-        F_drag = -0.5 * rho * Cd * A * |v| * v
+    Drag is modeled as quadratic relative-air drag:
+        F_drag = -k * |v_rel| * v_rel    where v_rel = v_drone - v_wind
 
-    Simplified to linear coefficient times v * |v|
+    v_wind = wind_mean_world + WindNoise (OU gust). For calm profile both are zero
+    and this reduces to the original drone-frame drag. WindNoise is updated in
+    apply_forces (separate OU stream from wake noise).
     """
     linear_drag = jnp.array(config.linear_drag)
+    wind_mean = jnp.array(config.wind_mean_world)
 
     @el.map
-    def compute_drag(vel: el.WorldVel) -> BodyDrag:
-        """Compute drag force from velocity."""
+    def compute_drag(vel: el.WorldVel, wind_state: WindNoise) -> BodyDrag:
+        """Compute drag force from relative-air velocity."""
         v = vel.linear()
-        v_mag = jnp.linalg.norm(v)
+        v_wind = wind_mean + wind_state          # mean + OU gust component
+        v_rel = v - v_wind
+        v_rel_mag = jnp.linalg.norm(v_rel)
 
-        # Quadratic drag: F = -k * |v| * v
-        drag_force = -linear_drag * v_mag * v
+        # Quadratic drag against air: F = -k * |v_rel| * v_rel
+        drag_force = -linear_drag * v_rel_mag * v_rel
 
         return drag_force
 
@@ -339,11 +359,19 @@ def create_apply_forces_system(config: DroneConfig):
     rotor_radius = config.rotor_radius
     disk_area = jnp.pi * rotor_radius ** 2
 
-    # OU noise parameters
+    # Wake OU parameters
     dt = config.sim_time_step
     tau = config.wake_noise_tau
     ou_decay = jnp.exp(-dt / tau)
     ou_diffusion = jnp.sqrt(1.0 - jnp.exp(-2.0 * dt / tau))
+
+    # Wind gust OU parameters (separate stream, independent of wake OU).
+    # For `calm` profile gust_std is 0, so wind_noise stays at zero and
+    # contributes nothing — full backward compatibility.
+    wind_gust_std = config.wind_gust_std
+    wind_tau = config.wind_gust_tau
+    wind_ou_decay = jnp.exp(-dt / wind_tau)
+    wind_ou_diffusion = jnp.sqrt(1.0 - jnp.exp(-2.0 * dt / wind_tau))
 
     # Multi-point ground contact: 4 points at arm undersides
     contact_pts_body = jnp.array(config.contact_points)  # (4, 3) in body FLU
@@ -363,7 +391,8 @@ def create_apply_forces_system(config: DroneConfig):
         sim_time: SimTime,
         motor_thrust: MotorThrust,
         noise_state: WakeNoise,
-    ) -> tuple[el.Force, WakeNoise]:
+        wind_state: WindNoise,
+    ) -> tuple[el.Force, WakeNoise, WindNoise]:
         """Apply all forces to the body."""
         # Rotate body thrust to world frame
         quat = pos.angular()
@@ -463,11 +492,20 @@ def create_apply_forces_system(config: DroneConfig):
         descent_intensity = jnp.clip(descent_ratio, 0.0, 2.0) ** 2 * thrust_fraction
 
         # OU noise update: noise_next = noise_prev * decay + diffusion * randn
-        # Use JAX deterministic PRNG keyed from tick for reproducibility
+        # Use JAX deterministic PRNG keyed from tick for reproducibility.
+        # Split into independent streams for wake (6 DOF) and wind (3D) so
+        # the two noise processes are uncorrelated.
         tick_int = jnp.int32(jnp.round(sim_time[0] / dt))
-        rng_key = jax.random.PRNGKey(tick_int)
-        white_noise = jax.random.normal(rng_key, shape=(6,))
+        base_key = jax.random.PRNGKey(tick_int)
+        wake_key, wind_key = jax.random.split(base_key, 2)
+
+        white_noise = jax.random.normal(wake_key, shape=(6,))
         new_noise = noise_state * ou_decay + ou_diffusion * white_noise
+
+        # Wind gust OU update. For calm profile wind_gust_std = 0, so
+        # wind_noise stays at zero regardless of decay/diffusion.
+        wind_white = jax.random.normal(wind_key, shape=(3,))
+        new_wind_noise = wind_state * wind_ou_decay + wind_ou_diffusion * wind_gust_std * wind_white
 
         # Scale noise by per-axis std dev and combined intensity
         force_std = jnp.array([ge_force_std, ge_force_std, ge_force_std])
@@ -490,7 +528,7 @@ def create_apply_forces_system(config: DroneConfig):
 
         # Sum all forces
         total = force + world_thrust + gravity_force + drag_force + angular_drag_force + ground_contact_force + wake_turbulence
-        return total, new_noise
+        return total, new_noise, new_wind_noise
 
     return apply_forces
 

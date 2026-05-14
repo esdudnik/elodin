@@ -29,6 +29,7 @@ E2E_CENTER_SCRIPT="$REPO_ROOT/e2e_center_semantics_test.py"
 E2E_MIDAIR_SCRIPT="$REPO_ROOT/e2e_midair_activation_test.py"
 E2E_SMOOTH_TAKEOFF_SCRIPT="$REPO_ROOT/e2e_smooth_takeoff_test.py"
 E2E_MANUAL_LANDING_SAFETY_SCRIPT="$REPO_ROOT/e2e_manual_landing_safety_test.py"
+E2E_LOW_ALT_HORIZONTAL_SCRIPT="$REPO_ROOT/e2e_low_alt_horizontal_test.py"
 BETAFLIGHT_DIR="$REPO_ROOT/../betaflight"
 LOG_FILE="/tmp/bf-elodin.log"
 E2E_LOG_FILE="/tmp/bf-e2e.log"
@@ -613,6 +614,26 @@ FOCUSED_TESTS=(
     "midair-activation:$E2E_MIDAIR_SCRIPT"
 )
 
+# ── Focused suite for wind investigations ──
+# Tests that exercise ALTHOLD altitude maintenance during XY disturbance.
+# Used with E2E_WIND_PROFILE={light,moderate,strong,gusty} to reproduce
+# real-hardware "ALTHOLD struggles in wind" symptoms. ground-idle is NOT
+# included here — it tests motor-stop predicate at idle, not altitude hold.
+WIND_TESTS=(
+    "angle-althold:$E2E_SCRIPT"
+    "acro-althold:$E2E_ACRO_SCRIPT"
+    "failsafe-althold:$E2E_FAILSAFE_SCRIPT"
+    "midair-activation:$E2E_MIDAIR_SCRIPT"
+)
+
+# ── POSHOLD wind suite ──
+# POSHOLD stress-tests XY drift compensation under wind. Separate from
+# ALTHOLD suite because POSHOLD failure modes (oscillation, integral wind-up)
+# differ from altitude-hold ones.
+WIND_POSHOLD_TESTS=(
+    "poshold:$E2E_POSHOLD_SCRIPT"
+)
+
 # Parse a runs argument. Accepts "5", "--runs=5", or empty (defaults to 1).
 parse_runs() {
     local arg="${1:-1}"
@@ -952,6 +973,149 @@ do_focused_suite() {
     fi
 }
 
+# ── Wind investigation suite ──
+# Args: $1 = tests-array-name ("WIND_TESTS" or "WIND_POSHOLD_TESTS"),
+#       $2 = runs arg (parse_runs format), defaults to 1
+#       $3 = suite display label (e.g. "ALTHOLD", "POSHOLD")
+#
+# Reads E2E_PHYSICS_PROFILE + E2E_WIND_PROFILE from env (validated in
+# config.py). Default physics=baseline, wind=moderate (if user didn't set —
+# we override here for "wind suite" semantics).
+#
+# Log path: /tmp/bf-e2e-${physics}_${wind}-${test}-r${N}.log
+# (combined profile prefix so wind runs don't overwrite physics-only runs)
+do_wind_suite() {
+    local tests_var="$1"
+    local runs
+    runs=$(parse_runs "${2:-1}")
+    local suite_label="${3:-wind}"
+
+    # Default wind profile to "moderate" for wind-suite if not set by user.
+    # Default physics profile to whatever env says, fall back to baseline.
+    if [ -z "${E2E_WIND_PROFILE:-}" ]; then
+        export E2E_WIND_PROFILE="moderate"
+    fi
+    if [ -z "${E2E_PHYSICS_PROFILE:-}" ]; then
+        export E2E_PHYSICS_PROFILE="baseline"
+    fi
+    local physics="${E2E_PHYSICS_PROFILE}"
+    local wind="${E2E_WIND_PROFILE}"
+    local log_prefix="${physics}_${wind}"
+
+    # bash 3.2 portable: expand tests array via eval
+    eval 'local tests=( "${'"$tests_var"'[@]}" )'
+
+    local total_tests=${#tests[@]}
+    local total_runs=$((runs * total_tests))
+    local total_passed=0 total_ctrl_fail=0 total_infra_final=0
+    local total_infra_first=0 total_recovered=0
+
+    local test_names=()
+    local test_passes=()
+    local test_ctrl_fails=()
+    local test_infra_first=()
+    local test_infra_final=()
+    for entry in "${tests[@]}"; do
+        test_names+=("${entry%%:*}")
+        test_passes+=(0)
+        test_ctrl_fails+=(0)
+        test_infra_first+=(0)
+        test_infra_final+=(0)
+    done
+
+    local suite_start
+    suite_start=$(date +%s)
+
+    echo ""
+    echo "========================================================================"
+    echo "  WIND SUITE — ${suite_label}  physics=${physics}  wind=${wind}  runs=${runs}  tests=${total_tests}"
+    echo "========================================================================"
+
+    local run_idx=0
+    while [ "$run_idx" -lt "$runs" ]; do
+        run_idx=$((run_idx + 1))
+        echo -e "\n────── Run $run_idx / $runs ──────"
+
+        local i=0
+        for entry in "${tests[@]}"; do
+            local name="${entry%%:*}"
+            local script="${entry#*:}"
+
+            echo -e "\n━━━ [run $run_idx] $name ━━━"
+
+            local rc=0
+            run_single_e2e "$script" "${log_prefix}-${name}-r${run_idx}" || rc=$?
+
+            local was_retried=0
+            if [ -n "$LAST_INFRA_REASON_FIRST" ]; then
+                case "$LAST_INFRA_REASON_FIRST" in
+                    sitl-died-no-output*|sitl-exited-during-startup*|startup-timeout*|sitl-alive-but-unresponsive*|sitl-unresponsive*|"fatal-init-signature: bind port"*) was_retried=1 ;;
+                esac
+                if [ "${E2E_NO_RETRY:-0}" = "1" ]; then was_retried=0; fi
+                total_infra_first=$((total_infra_first + 1))
+                test_infra_first[$i]=$((${test_infra_first[$i]} + 1))
+            fi
+
+            case $rc in
+                0)
+                    test_passes[$i]=$((${test_passes[$i]} + 1))
+                    total_passed=$((total_passed + 1))
+                    [ $was_retried -eq 1 ] && total_recovered=$((total_recovered + 1))
+                    ;;
+                2)
+                    test_infra_final[$i]=$((${test_infra_final[$i]} + 1))
+                    total_infra_final=$((total_infra_final + 1))
+                    if [ -z "$LAST_INFRA_REASON_FIRST" ]; then
+                        total_infra_first=$((total_infra_first + 1))
+                        test_infra_first[$i]=$((${test_infra_first[$i]} + 1))
+                    fi
+                    ;;
+                *)
+                    test_ctrl_fails[$i]=$((${test_ctrl_fails[$i]} + 1))
+                    total_ctrl_fail=$((total_ctrl_fail + 1))
+                    [ $was_retried -eq 1 ] && total_recovered=$((total_recovered + 1))
+                    ;;
+            esac
+            i=$((i + 1))
+        done
+    done
+
+    local suite_end
+    suite_end=$(date +%s)
+    local suite_duration=$((suite_end - suite_start))
+    local suite_min=$((suite_duration / 60))
+    local suite_sec=$((suite_duration % 60))
+
+    local effective_total=$((total_passed + total_ctrl_fail))
+
+    echo ""
+    echo "========================================================================"
+    echo "  WIND SUITE RESULTS — ${suite_label}  physics=${physics}  wind=${wind}  runs=${runs}"
+    echo "========================================================================"
+    echo "  Total runs: $total_runs  Pass: $total_passed  Ctrl-fail: $total_ctrl_fail  Infra-fail (final): $total_infra_final  Duration: ${suite_min}m ${suite_sec}s"
+    if [ $effective_total -gt 0 ]; then
+        echo "  Effective pass rate: $total_passed/$effective_total (excludes final infra failures)"
+    fi
+
+    echo ""
+    echo "  Per-test breakdown (across $runs runs):"
+    printf "    %-22s  %-7s  %-9s  %-13s\n" "test" "pass" "ctrl-fail" "infra (final)"
+    local i=0
+    for name in "${test_names[@]}"; do
+        printf "    %-22s  %d/%d    %d/%d      %d/%d\n" "$name" "${test_passes[$i]}" "$runs" "${test_ctrl_fails[$i]}" "$runs" "${test_infra_final[$i]}" "$runs"
+        i=$((i + 1))
+    done
+
+    echo ""
+    echo "  Per-run logs: /tmp/bf-e2e-${log_prefix}-<test>-r<N>.log"
+    echo "========================================================================"
+
+    if   [ $total_ctrl_fail -gt 0 ];  then return 1
+    elif [ $total_infra_final -gt 0 ]; then return 2
+    else                                    return 0
+    fi
+}
+
 # ── Run all automated E2E tests sequentially, optionally for N cycles ──
 # Args: $1 = runs arg (parse_runs format). Defaults to 1.
 #
@@ -978,6 +1142,7 @@ do_e2e_all() {
         "e2e-failsafe-init:$E2E_FAILSAFE_INIT_SCRIPT"
         "e2e-midair-activation:$E2E_MIDAIR_SCRIPT"
         "e2e-poshold:$E2E_POSHOLD_SCRIPT"
+        "e2e-low-alt-horizontal:$E2E_LOW_ALT_HORIZONTAL_SCRIPT"
     )
 
     local num_tests=${#tests[@]}
@@ -1344,11 +1509,20 @@ case "$MODE" in
     e2e-manual-landing-safety)
         do_single_test_runs "$E2E_MANUAL_LANDING_SAFETY_SCRIPT" "manual-landing-safety" "${2:-1}"
         ;;
+    e2e-low-alt-horizontal)
+        do_single_test_runs "$E2E_LOW_ALT_HORIZONTAL_SCRIPT" "low-alt-horizontal" "${2:-1}"
+        ;;
     e2e-strict)
         do_focused_suite strict "${2:-1}"
         ;;
     e2e-realistic)
         do_focused_suite realistic "${2:-1}"
+        ;;
+    e2e-wind-althold)
+        do_wind_suite WIND_TESTS "${2:-1}" "ALTHOLD"
+        ;;
+    e2e-wind-poshold)
+        do_wind_suite WIND_POSHOLD_TESTS "${2:-1}" "POSHOLD"
         ;;
     check)
         do_check_logs
@@ -1373,12 +1547,22 @@ case "$MODE" in
         echo "  e2e-failsafe-init         [N|--runs=N] - failsafe from INITIALIZE test"
         echo "  e2e-midair-activation     [N|--runs=N] - mid-air ALTHOLD activation safety test"
         echo "  e2e-poshold               [N|--runs=N] - position hold test"
+        echo "  e2e-low-alt-horizontal    [N|--runs=N] - low-altitude horizontal flight (spin-lock regression)"
         echo ""
         echo "  e2e-*-editor                          - any test above with 3D viewport (no multi-run)"
-        echo "  e2e-strict    [N|--runs=N]            - focused suite under strict physics profile, N runs"
-        echo "  e2e-realistic [N|--runs=N]            - focused suite under realistic physics profile (no thrust gate, matches real hardware), N runs"
-        echo "  all                       - build-bf + rebuild-elodin + run (default)"
-        echo "  check                     - analyze log file at $LOG_FILE"
+        echo "  e2e-strict       [N|--runs=N]         - focused suite under strict physics profile, N runs"
+        echo "  e2e-realistic    [N|--runs=N]         - focused suite under realistic physics profile (no thrust gate, matches real hardware), N runs"
+        echo "  e2e-wind-althold [N|--runs=N]         - ALTHOLD suite under wind (angle, acro, failsafe-althold, midair), N runs"
+        echo "  e2e-wind-poshold [N|--runs=N]         - POSHOLD wind drift test, N runs"
+        echo "  all                                   - build-bf + rebuild-elodin + run (default)"
+        echo "  check                                 - analyze log file at $LOG_FILE"
+        echo ""
+        echo "Environment variables:"
+        echo "  E2E_PHYSICS_PROFILE=baseline|strict|realistic (default: baseline)"
+        echo "                                        - IGE physics severity"
+        echo "  E2E_WIND_PROFILE=calm|light|moderate|strong|gusty (default: calm)"
+        echo "                                        - ambient wind, gusty matches hardware test (2-5 m/s, 1-2s gusts)"
+        echo "  Both can be set independently. e2e-wind-* targets default wind to 'moderate' if unset."
         exit 1
         ;;
 esac
