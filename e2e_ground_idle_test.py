@@ -61,6 +61,17 @@ TREND_IGNORE_INITIAL = 1.0      # seconds — skip first N seconds of GROUND_IDL
 TREND_MAX_INCREASE = 0.02       # max allowed motor increase from early to late window
 MOTOR_SOFT_WARNING = 0.15       # soft warning threshold (doesn't fail)
 
+# UX assertion (v10.3.6): during ARM + GROUND_IDLE with ALTHOLD on, motors must
+# visibly spin (alt_hold_ground_spin default = 50 → motors at ~2.5% PWM SITL
+# or ~3.7% DSHOT). Guards against Session 14-style regression where motors
+# fully stopped at ARM and drone appeared "dead" on the bench.
+# Sustained criterion (not peak): single spike doesn't pass — must hold across
+# the majority of armed time. Threshold 0.015 (1.5%) is below expected level
+# but well above zero / DSHOT noise floor.
+MIN_MOTOR_SPIN_THRESHOLD = 0.015  # normalized motor output — clearly above 0
+MIN_SPINNING_FRACTION = 0.80      # 80% of post-settle armed samples must exceed threshold
+ARM_SETTLE_DELAY = 0.5            # s — skip first 0.5s of ARM (BF ESC arm cycle transients)
+
 TEST_TIMEOUT = 60.0
 
 CH_ROLL = 0
@@ -112,6 +123,13 @@ class TestState:
 
     # Motor trend tracking during GROUND_IDLE
     motor_samples: list = field(default_factory=list)  # list of (time, max_motor) tuples
+
+    # UX motor-spin tracking (v10.3.6) — sustained "motors visibly spinning"
+    # during ARM + GROUND_IDLE phases. Counters incremented per-tick after the
+    # ARM_SETTLE_DELAY guard. spinning is the subset where max(motors) exceeds
+    # the visibility threshold.
+    motor_samples_armed: int = 0
+    motor_samples_spinning: int = 0
 
     crash_detected: bool = False
     crash_reason: str = ""
@@ -174,6 +192,16 @@ def build_rc_channels(state: TestState) -> np.ndarray:
 def update_phase(state: TestState, t: float, dt: float):
     phase = state.phase
     elapsed = state.phase_elapsed(t)
+
+    # UX motor-spin tracking (v10.3.6) — sample per tick during ARM + GROUND_IDLE,
+    # skipping ARM_SETTLE_DELAY at the start of ARM to ignore BF ESC arm cycle
+    # transients. Counts samples and the subset above the visibility threshold.
+    if phase in (Phase.ARM, Phase.GROUND_IDLE):
+        settled = (phase != Phase.ARM) or (elapsed >= ARM_SETTLE_DELAY)
+        if settled and state.motors is not None and len(state.motors) > 0:
+            state.motor_samples_armed += 1
+            if float(np.max(state.motors)) > MIN_MOTOR_SPIN_THRESHOLD:
+                state.motor_samples_spinning += 1
 
     if phase == Phase.BOOT:
         if elapsed >= BOOT_DURATION:
@@ -319,6 +347,22 @@ def print_results(state: TestState):
         passed = False
 
         issues.append("No motor responses")
+
+    # UX assertion (v10.3.6) — motors must sustain visible spin during armed
+    # ARM/GROUND_IDLE phases. Guards against Session 14 regression (motors fully
+    # stopped at ARM with ALTHOLD on → drone appears dead on the bench).
+    # Sustained criterion (not peak) — a single spike doesn't satisfy.
+    if state.motor_samples_armed > 0:
+        spinning_frac = state.motor_samples_spinning / state.motor_samples_armed
+        if spinning_frac < MIN_SPINNING_FRACTION:
+            passed = False
+            issues.append(
+                f"Motors did not sustain visible spin during ARM/GROUND_IDLE "
+                f"(spinning {state.motor_samples_spinning}/{state.motor_samples_armed} samples = "
+                f"{spinning_frac*100:.1f}% < required {MIN_SPINNING_FRACTION*100:.0f}% above "
+                f"{MIN_MOTOR_SPIN_THRESHOLD}). UX regression — drone appears dead at ARM. "
+                f"Check alt_hold_ground_spin (default 50, CLI: 'set alt_hold_ground_spin = 50')"
+            )
 
     state.test_passed = passed
 
