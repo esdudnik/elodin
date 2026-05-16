@@ -204,12 +204,20 @@ def build_rc_channels(state: TestState) -> np.ndarray:
         channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
         channels[CH_THROTTLE] = T_HOVER
-    elif phase in (Phase.LOW_PASS_DESCEND, Phase.LOW_PASS_DWELL,
-                   Phase.COMMIT_DESCEND, Phase.COMMIT_LAND):
+    elif phase in (Phase.LOW_PASS_DESCEND, Phase.LOW_PASS_DWELL, Phase.COMMIT_DESCEND):
         channels[CH_ARM] = MODE_ON
         channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
         channels[CH_THROTTLE] = T_DESCEND
+    elif phase == Phase.COMMIT_LAND:
+        # v10.5.1: stick must be at RC_LOW (THROTTLE_LOW gate) to trigger
+        # auto-disarm. T_DESCEND (1300, above mincheck) is no longer sufficient.
+        # touchdownDwellMs accumulator now requires sustained THROTTLE_LOW —
+        # explicit pilot commit, matches iNav throttleStickIsLow() semantics.
+        channels[CH_ARM] = MODE_ON
+        channels[CH_ANGLE] = MODE_ON
+        channels[CH_ALTHOLD] = MODE_ON
+        channels[CH_THROTTLE] = RC_LOW
     elif phase == Phase.LOW_PASS_RECOVER:
         channels[CH_ARM] = MODE_ON
         channels[CH_ANGLE] = MODE_ON

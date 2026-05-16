@@ -318,11 +318,15 @@ def build_rc_channels(state: TestState) -> np.ndarray:
         channels[CH_THROTTLE] = ALTHOLD_HOLD  # center = hold altitude
 
     elif phase == Phase.LAND:
-        # Controlled landing: keep ALT_HOLD active with gentle descend.
+        # v10.5.1: explicit commit-to-land requires THROTTLE_LOW (stick at
+        # mincheck). Old APPROACH_THROTTLE (1380) relied on legacy
+        # isAltHoldLandingDetected (auto-disarm at any alt<4m with descentIntent)
+        # — that path caused real-hardware mid-flight false-positive disarms.
+        # Now auto-disarm requires stick at RC_LOW sustained 1s at alt<30cm.
         channels[CH_ARM] = MODE_ON
         channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = APPROACH_THROTTLE  # gentle descent to touchdown
+        channels[CH_THROTTLE] = RC_LOW
 
     elif phase == Phase.DISARM:
         channels[CH_THROTTLE] = RC_LOW

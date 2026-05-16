@@ -30,6 +30,7 @@ E2E_MIDAIR_SCRIPT="$REPO_ROOT/e2e_midair_activation_test.py"
 E2E_SMOOTH_TAKEOFF_SCRIPT="$REPO_ROOT/e2e_smooth_takeoff_test.py"
 E2E_MANUAL_LANDING_SAFETY_SCRIPT="$REPO_ROOT/e2e_manual_landing_safety_test.py"
 E2E_LOW_ALT_HORIZONTAL_SCRIPT="$REPO_ROOT/e2e_low_alt_horizontal_test.py"
+E2E_LOW_ALT_HOVER_NO_DISARM_SCRIPT="$REPO_ROOT/e2e_low_alt_hover_no_disarm_test.py"
 BETAFLIGHT_DIR="$REPO_ROOT/../betaflight"
 LOG_FILE="/tmp/bf-elodin.log"
 E2E_LOG_FILE="/tmp/bf-e2e.log"
@@ -622,6 +623,7 @@ FOCUSED_TESTS=(
     "failsafe-init:$E2E_FAILSAFE_INIT_SCRIPT"
     "midair-activation:$E2E_MIDAIR_SCRIPT"
     "low-alt-horizontal:$E2E_LOW_ALT_HORIZONTAL_SCRIPT"
+    "low-alt-hover-no-disarm:$E2E_LOW_ALT_HOVER_NO_DISARM_SCRIPT"
 )
 
 # ── Wind suite (ALTHOLD) ──
@@ -1156,6 +1158,7 @@ do_e2e_all() {
         "e2e-midair-activation:$E2E_MIDAIR_SCRIPT"
         "e2e-poshold:$E2E_POSHOLD_SCRIPT"
         "e2e-low-alt-horizontal:$E2E_LOW_ALT_HORIZONTAL_SCRIPT"
+        "e2e-low-alt-hover-no-disarm:$E2E_LOW_ALT_HOVER_NO_DISARM_SCRIPT"
     )
 
     local num_tests=${#tests[@]}
@@ -1526,6 +1529,9 @@ case "$MODE" in
     e2e-low-alt-horizontal)
         do_single_test_runs "$E2E_LOW_ALT_HORIZONTAL_SCRIPT" "low-alt-horizontal" "${2:-1}"
         ;;
+    e2e-low-alt-hover-no-disarm)
+        do_single_test_runs "$E2E_LOW_ALT_HOVER_NO_DISARM_SCRIPT" "low-alt-hover-no-disarm" "${2:-1}"
+        ;;
     e2e-all-strict)
         # 12 tests (full set) under strict physics profile. Diagnostic lane —
         # may show new failures under stricter IGE (use as non-blocking).
@@ -1573,9 +1579,9 @@ case "$MODE" in
         echo "  check                                 - analyze log file at $LOG_FILE"
         echo ""
         echo "E2E suites (all under realistic IGE physics by default):"
-        echo "  e2e-all          [N|--runs=N]         - ALL 12 automated tests (default 1 cycle)"
-        echo "  e2e-all-strict   [N|--runs=N]         - ALL 12 tests under strict IGE (diagnostic lane)"
-        echo "  e2e-focused      [N|--runs=N]         - 6 IGE-sensitive tests (default 5 cycles)"
+        echo "  e2e-all          [N|--runs=N]         - ALL 13 automated tests (default 1 cycle)"
+        echo "  e2e-all-strict   [N|--runs=N]         - ALL 13 tests under strict IGE (diagnostic lane)"
+        echo "  e2e-focused      [N|--runs=N]         - 7 IGE-sensitive tests (default 5 cycles)"
         echo "  e2e-wind-althold [N|--runs=N]         - 6 ALTHOLD tests under wind (default moderate)"
         echo "  e2e-wind-poshold [N|--runs=N]         - POSHOLD wind drift test"
         echo ""
@@ -1593,6 +1599,7 @@ case "$MODE" in
         echo "  e2e-midair-activation     [N|--runs=N] - mid-air ALTHOLD activation safety test"
         echo "  e2e-poshold               [N|--runs=N] - position hold test"
         echo "  e2e-low-alt-horizontal    [N|--runs=N] - low-altitude horizontal flight (spin-lock regression)"
+        echo "  e2e-low-alt-hover-no-disarm [N|--runs=N] - ALTHOLD low-alt hover must NOT auto-disarm (v10.5.1 regression)"
         echo ""
         echo "  e2e-*-editor                          - any test above with 3D viewport (no multi-run)"
         echo ""

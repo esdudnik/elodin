@@ -222,10 +222,14 @@ def build_rc_channels(state: TestState) -> np.ndarray:
         channels[CH_THROTTLE] = ALTHOLD_DESCEND
 
     elif phase == Phase.LAND:
+        # v10.5.1: commit-to-land requires THROTTLE_LOW (stick at mincheck).
+        # Old behavior auto-disarmed at any alt<4m with stick<center; new
+        # behavior requires explicit pilot commit (stick at RC_LOW sustained
+        # 1s at alt<30cm). LAND phase now uses RC_LOW so auto-disarm fires.
         channels[CH_ARM] = MODE_ON
         channels[CH_ANGLE] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = ALTHOLD_DESCEND
+        channels[CH_THROTTLE] = RC_LOW
 
     elif phase == Phase.DISARM:
         channels[CH_THROTTLE] = RC_LOW

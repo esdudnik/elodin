@@ -300,9 +300,11 @@ def build_rc_channels(state: TestState) -> np.ndarray:
         channels[CH_THROTTLE] = ALTHOLD_HOLD
 
     elif phase == Phase.LAND:
+        # v10.5.1: explicit commit-to-land via THROTTLE_LOW (was APPROACH_THROTTLE
+        # 1380, relied on legacy 4m-threshold isAltHoldLandingDetected path).
         channels[CH_ARM] = MODE_ON
         channels[CH_ALTHOLD] = MODE_ON
-        channels[CH_THROTTLE] = APPROACH_THROTTLE
+        channels[CH_THROTTLE] = RC_LOW
 
     elif phase == Phase.DISARM:
         channels[CH_THROTTLE] = RC_LOW
