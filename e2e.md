@@ -21,7 +21,7 @@ all categories of failure went to zero:
 Hardware validation pending. See `betaflight/progress.md` Session 14-15 for full
 context.
 
-## Test Suite (12 tests, 11 automated + 1 manual)
+## Test Suite (13 tests in e2e-all + 1 standalone + 1 manual)
 
 | # | Test | File | Command | What it validates |
 |---|------|------|---------|-------------------|
@@ -36,13 +36,15 @@ context.
 | 9 | Failsafe init | `e2e_failsafe_initialize_test.py` | `./run.sh e2e-failsafe-init` | Failsafe from INITIALIZE state |
 | 10 | Mid-air activation | `e2e_midair_activation_test.py` | `./run.sh e2e-midair-activation` | Safe activation at low stick mid-flight |
 | 11 | POSHOLD | `e2e_poshold_test.py` | `./run.sh e2e-poshold` | Position hold with virtual mag |
-| 12 | Manual landing safety | `e2e_manual_landing_safety_test.py` | `./run.sh e2e-manual-landing-safety` | Low-pass + commit-land anti-regression |
+| 12 | Low-alt horizontal | `e2e_low_alt_horizontal_test.py` | `./run.sh e2e-low-alt-horizontal` | Spin-lock predicate doesn't fire mid-flight |
+| 13 | Low-alt hover no-disarm | `e2e_low_alt_hover_no_disarm_test.py` | `./run.sh e2e-low-alt-hover-no-disarm` | Auto-disarm doesn't fire at low-alt slow descent (v10.5.1) |
+| — | Manual landing safety | `e2e_manual_landing_safety_test.py` | `./run.sh e2e-manual-landing-safety` | Low-pass + commit-land anti-regression (NOT in e2e-all suite) |
 | — | Throttle curve (manual) | `e2e_throttle_curve_test.py` | `python3 e2e_throttle_curve_test.py run --no-s10` | Curve-aware midpoint with thr_mid=30 |
 
 All tests support `[N|--runs=N]` for multi-run with per-run logs:
 ```bash
 ./run.sh e2e-midair-activation --runs=10
-./run.sh e2e-all --runs=5     # 11 tests × 5 cycles = 55 runs
+./run.sh e2e-all --runs=5     # 13 tests × 5 cycles = 65 runs
 ```
 
 ## Physics Profiles
@@ -61,14 +63,15 @@ Severity ordering: `baseline` < `strict` < `realistic`.
 `baseline` remains a valid value for ad-hoc diagnostic override but no built-in
 target uses it (tests without IGE don't model real propwash + ground effect).
 
-**Focused suite** (6 IGE-sensitive tests: ground-idle, nosettle-takeoff,
-failsafe-althold, failsafe-init, midair-activation, low-alt-horizontal):
+**Focused suite** (7 IGE-sensitive tests: ground-idle, nosettle-takeoff,
+failsafe-althold, failsafe-init, midair-activation, low-alt-horizontal,
+low-alt-hover-no-disarm):
 ```bash
 ./run.sh e2e-focused [N|--runs=N]                 # realistic + 5 cycles default
 E2E_PHYSICS_PROFILE=strict ./run.sh e2e-focused   # same suite under strict
 ```
 
-**Full suite under strict** (12 tests — diagnostic lane, may show new failures):
+**Full suite under strict** (13 tests — diagnostic lane, may show new failures):
 ```bash
 ./run.sh e2e-all-strict [N|--runs=N]
 ```
@@ -103,10 +106,10 @@ E2E_PHYSICS_PROFILE=strict ./run.sh e2e-midair-activation --runs=10       # stri
 
 ### Run full suite
 ```bash
-./run.sh e2e-all                                          # 12 tests, realistic, 1 cycle (~25 min)
-./run.sh e2e-all --runs=5                                 # 12 tests × 5 cycles = 60 runs (~125 min)
-./run.sh e2e-all-strict                                   # 12 tests under strict (diagnostic lane)
-./run.sh e2e-focused --runs=10                            # focused 6 × 10 = 60 runs (~115 min)
+./run.sh e2e-all                                          # 13 tests, realistic, 1 cycle (~28 min)
+./run.sh e2e-all --runs=5                                 # 13 tests × 5 cycles = 65 runs (~140 min)
+./run.sh e2e-all-strict                                   # 13 tests under strict (diagnostic lane)
+./run.sh e2e-focused --runs=10                            # focused 7 × 10 = 70 runs (~120 min)
 ```
 
 ### Editor mode (3D viewport)

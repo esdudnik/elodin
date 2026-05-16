@@ -75,12 +75,12 @@ install-elodin                 # Build everything (Python SDK + binaries)
 # Single E2E tests (all default to realistic IGE physics, v10.4)
 ./run.sh e2e-ground-idle                 # ground-idle regression test
 ./run.sh e2e-failsafe-althold            # failsafe descent landing test
-./run.sh e2e-all                         # 12-test full regression suite (~25 min)
+./run.sh e2e-all                         # 13-test full regression suite (~28 min)
 # (and many more — see ./run.sh with no args)
 
 # Stress / focused suites (v10.4)
-./run.sh e2e-all-strict     [N|--runs=N] # ALL 12 tests under strict IGE (diagnostic lane)
-./run.sh e2e-focused        [N|--runs=N] # 6 IGE-sensitive tests under realistic (default 5 cycles)
+./run.sh e2e-all-strict     [N|--runs=N] # ALL 13 tests under strict IGE (diagnostic lane)
+./run.sh e2e-focused        [N|--runs=N] # 7 IGE-sensitive tests under realistic (default 5 cycles)
 ./run.sh e2e-wind-althold   [N|--runs=N] # 6 ALTHOLD tests under wind (default moderate)
 ./run.sh e2e-wind-poshold   [N|--runs=N] # POSHOLD wind drift
 ```
@@ -99,20 +99,20 @@ The removed targets exit with `1` and print migration help.
 
 | What you want | Command | Tests run | Profile | Cycles | Approx duration |
 |---|---|---|---|---|---|
-| Smoke test (focused, default cycles) | `./run.sh e2e-focused` | Focused 6 | realistic | 5 (= 30 runs) | ~50 min |
-| Confidence run (focused, multi-cycle) | `./run.sh e2e-focused --runs=10` | Focused 6 | realistic | 10 (= 60 runs) | ~100 min |
-| Focused under strict | `E2E_PHYSICS_PROFILE=strict ./run.sh e2e-focused` | Focused 6 | strict | 5 | ~50 min |
-| Full regression (default) | `./run.sh e2e-all` | All 12 | realistic | 1 | ~25 min |
-| Full regression multi-run | `./run.sh e2e-all --runs=5` | All 12 | realistic | 5 (= 60 runs) | ~125 min |
-| Full under strict (diagnostic) | `./run.sh e2e-all-strict` | All 12 | strict | 1 | ~25 min |
+| Smoke test (focused, default cycles) | `./run.sh e2e-focused` | Focused 7 | realistic | 5 (= 35 runs) | ~60 min |
+| Confidence run (focused, multi-cycle) | `./run.sh e2e-focused --runs=10` | Focused 7 | realistic | 10 (= 70 runs) | ~120 min |
+| Focused under strict | `E2E_PHYSICS_PROFILE=strict ./run.sh e2e-focused` | Focused 7 | strict | 5 | ~60 min |
+| Full regression (default) | `./run.sh e2e-all` | All 13 | realistic | 1 | ~28 min |
+| Full regression multi-run | `./run.sh e2e-all --runs=5` | All 13 | realistic | 5 (= 65 runs) | ~140 min |
+| Full under strict (diagnostic) | `./run.sh e2e-all-strict` | All 13 | strict | 1 | ~28 min |
 | Single test | `./run.sh e2e-ground-idle` | 1 | realistic | 1 | ~1-3 min |
 | Single test under strict | `E2E_PHYSICS_PROFILE=strict ./run.sh e2e-ground-idle` | 1 | strict | 1 | ~1-3 min |
 | Wind ALTHOLD suite (default moderate) | `./run.sh e2e-wind-althold` | 6 ALTHOLD | realistic | 1 | ~15 min |
 | Wind ALTHOLD under gusty | `E2E_WIND_PROFILE=gusty ./run.sh e2e-wind-althold` | 6 ALTHOLD | realistic + gusty | 1 | ~15 min |
 
-**Focused 6 vs All 12:**
-- **Focused 6** (IGE-sensitive): `ground-idle`, `nosettle-takeoff`, `failsafe-althold`, `failsafe-init`, `midair-activation`, `low-alt-horizontal` — exercise near-ground / failsafe / spin-lock paths where IGE matters.
-- **All 12** (`e2e-all` set): focused 6 + `smooth-takeoff`, `center-semantics`, `angle-althold`, `acro-althold`, `flight`, `poshold` — extra 6 are in-flight or non-IGE behavior.
+**Focused 7 vs All 13:**
+- **Focused 7** (IGE-sensitive): `ground-idle`, `nosettle-takeoff`, `failsafe-althold`, `failsafe-init`, `midair-activation`, `low-alt-horizontal`, `low-alt-hover-no-disarm` — exercise near-ground / failsafe / spin-lock / auto-disarm paths where IGE matters.
+- **All 13** (`e2e-all` set): focused 7 + `smooth-takeoff`, `center-semantics`, `angle-althold`, `acro-althold`, `flight`, `poshold` — extra 6 are in-flight or non-IGE behavior.
 
 **Env-var override:** `E2E_PHYSICS_PROFILE=name ./run.sh <target>` overrides the default (realistic) for that one invocation. Useful for `baseline` diagnostic comparison (rare) or `strict` stress test on a single target.
 
