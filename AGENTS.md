@@ -72,44 +72,51 @@ install-elodin                 # Build everything (Python SDK + binaries)
 ./run.sh all                             # build-bf + rebuild-elodin + run (default)
 ./run.sh check                           # Analyze log file at /tmp/bf-elodin.log
 
-# Single E2E tests (production physics: baseline IGE gates)
+# Single E2E tests (all default to realistic IGE physics, v10.4)
 ./run.sh e2e-ground-idle                 # ground-idle regression test
 ./run.sh e2e-failsafe-althold            # failsafe descent landing test
-./run.sh e2e-all                         # 11-test regression suite (~25 min)
+./run.sh e2e-all                         # 12-test full regression suite (~25 min)
 # (and many more — see ./run.sh with no args)
 
-# Diagnostic physics profiles (since 2026-05-01)
-./run.sh e2e-strict    [N|--runs=N]      # focused suite under "strict" IGE profile (partial gate)
-./run.sh e2e-realistic [N|--runs=N]      # focused suite under "realistic" IGE profile (no gate, matches real HW)
+# Stress / focused suites (v10.4)
+./run.sh e2e-all-strict     [N|--runs=N] # ALL 12 tests under strict IGE (diagnostic lane)
+./run.sh e2e-focused        [N|--runs=N] # 6 IGE-sensitive tests under realistic (default 5 cycles)
+./run.sh e2e-wind-althold   [N|--runs=N] # 6 ALTHOLD tests under wind (default moderate)
+./run.sh e2e-wind-poshold   [N|--runs=N] # POSHOLD wind drift
 ```
 
-The `e2e-strict` and `e2e-realistic` targets set `E2E_PHYSICS_PROFILE` and run
-the focused subset (`ground-idle`, `nosettle-takeoff`, `failsafe-althold`,
-`failsafe-init`, `midair-activation`) — used to expose IGE-related controller
-or mixer issues that would otherwise be hidden by the `baseline` thrust gate.
-Severity ordering: `baseline` < `strict` < `realistic`.
+**v10.4 default**: `realistic` is the default physics profile for all targets.
+The focused suite (6 IGE-sensitive tests: `ground-idle`, `nosettle-takeoff`,
+`failsafe-althold`, `failsafe-init`, `midair-activation`, `low-alt-horizontal`)
+is invoked via `e2e-focused`. Severity ordering: `baseline` < `strict` < `realistic`.
 See `sim_world.md` for the physics-profile reference table.
+
+**Removed in v10.4**: `e2e-strict` (use `e2e-all-strict` or `E2E_PHYSICS_PROFILE=strict ./run.sh e2e-focused`).
+`e2e-realistic` (use `e2e-all` since realistic is now default, or `e2e-focused`).
+The removed targets exit with `1` and print migration help.
 
 ### E2E command cheat-sheet (which command for which goal)
 
 | What you want | Command | Tests run | Profile | Cycles | Approx duration |
 |---|---|---|---|---|---|
-| Smoke test (focused, single cycle) | `./run.sh e2e-realistic` | Focused 5 | realistic | 1 | ~8 min |
-| Confidence run (focused, multi-cycle) | `./run.sh e2e-realistic --runs=5` | Focused 5 | realistic | 5 (= 25 runs) | ~40 min |
-| Stricter-than-baseline regression pressure | `./run.sh e2e-strict --runs=5` | Focused 5 | strict | 5 | ~40 min |
-| Baseline regression (default CI gate) | `./run.sh e2e-all` | All 11 | baseline | 1 | ~25 min |
-| All 11 tests under realistic (no built-in target) | `E2E_PHYSICS_PROFILE=realistic ./run.sh e2e-all` | All 11 | realistic | 1 | ~25 min |
-| All 11, multi-run, realistic (manual loop) | `for i in 1 2 3 4 5; do E2E_PHYSICS_PROFILE=realistic ./run.sh e2e-all; done` | All 11 | realistic | 5 (= 55 runs) | ~2h |
-| Single individual test, default profile | `./run.sh e2e-ground-idle` (or any other `e2e-*` name) | 1 | baseline (default) | 1 | ~1-3 min |
-| Single individual test under realistic | `E2E_PHYSICS_PROFILE=realistic ./run.sh e2e-ground-idle` | 1 | realistic | 1 | ~1-3 min |
+| Smoke test (focused, default cycles) | `./run.sh e2e-focused` | Focused 6 | realistic | 5 (= 30 runs) | ~50 min |
+| Confidence run (focused, multi-cycle) | `./run.sh e2e-focused --runs=10` | Focused 6 | realistic | 10 (= 60 runs) | ~100 min |
+| Focused under strict | `E2E_PHYSICS_PROFILE=strict ./run.sh e2e-focused` | Focused 6 | strict | 5 | ~50 min |
+| Full regression (default) | `./run.sh e2e-all` | All 12 | realistic | 1 | ~25 min |
+| Full regression multi-run | `./run.sh e2e-all --runs=5` | All 12 | realistic | 5 (= 60 runs) | ~125 min |
+| Full under strict (diagnostic) | `./run.sh e2e-all-strict` | All 12 | strict | 1 | ~25 min |
+| Single test | `./run.sh e2e-ground-idle` | 1 | realistic | 1 | ~1-3 min |
+| Single test under strict | `E2E_PHYSICS_PROFILE=strict ./run.sh e2e-ground-idle` | 1 | strict | 1 | ~1-3 min |
+| Wind ALTHOLD suite (default moderate) | `./run.sh e2e-wind-althold` | 6 ALTHOLD | realistic | 1 | ~15 min |
+| Wind ALTHOLD under gusty | `E2E_WIND_PROFILE=gusty ./run.sh e2e-wind-althold` | 6 ALTHOLD | realistic + gusty | 1 | ~15 min |
 
-**Focused 5 vs All 11:**
-- **Focused 5** (IGE-sensitive): `ground-idle`, `nosettle-takeoff`, `failsafe-althold`, `failsafe-init`, `midair-activation` — exercise near-ground / failsafe paths where IGE matters.
-- **All 11** (`e2e-all` set): focused 5 + `smooth-takeoff`, `center-semantics`, `angle-althold`, `acro-althold`, `flight`, `poshold` — extra 6 are in-flight or non-IGE behavior; running them under `realistic` adds time without adding diagnostic value (per `strict_test.md`).
+**Focused 6 vs All 12:**
+- **Focused 6** (IGE-sensitive): `ground-idle`, `nosettle-takeoff`, `failsafe-althold`, `failsafe-init`, `midair-activation`, `low-alt-horizontal` — exercise near-ground / failsafe / spin-lock paths where IGE matters.
+- **All 12** (`e2e-all` set): focused 6 + `smooth-takeoff`, `center-semantics`, `angle-althold`, `acro-althold`, `flight`, `poshold` — extra 6 are in-flight or non-IGE behavior.
 
-**Env-var trick:** `E2E_PHYSICS_PROFILE=name ./run.sh <target>` sets the profile for that one invocation only. Variable doesn't persist in your shell after the command finishes. Useful for ad-hoc combinations not covered by the dedicated targets.
+**Env-var override:** `E2E_PHYSICS_PROFILE=name ./run.sh <target>` overrides the default (realistic) for that one invocation. Useful for `baseline` diagnostic comparison (rare) or `strict` stress test on a single target.
 
-**What the runner reports** (since Step 1.5, 2026-05-02): both `e2e-all` and `e2e-strict`/`e2e-realistic` summaries include `Pass / Ctrl-fail / Infra-fail` three-column counts, `Effective pass rate` excluding infra failures, per-test result lines tagged `PASS`/`FAIL`/`INFRA`, an `Infra-fail reasons:` section with causes (`ports-still-held`, `sitl-died-during-test`, `startup-timeout`, etc.), and a three-state return code (0/1/2).
+**What the runner reports** (since Step 1.5, 2026-05-02): both `e2e-all` and focused/wind suite summaries include `Pass / Ctrl-fail / Infra-fail` three-column counts, `Effective pass rate` excluding infra failures, per-test result lines tagged `PASS`/`FAIL`/`INFRA`, an `Infra-fail reasons:` section with causes (`ports-still-held`, `sitl-died-during-test`, `startup-timeout`, etc.), and a three-state return code (0/1/2). v10.4 also prints `Effective physics profile: <name>` at suite start.
 
 **Logs:**
 - Single test: `/tmp/bf-e2e-<test>.log`

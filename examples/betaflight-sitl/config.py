@@ -49,8 +49,14 @@ _VALID_WIND_PROFILES = ("calm", "light", "moderate", "strong", "gusty")
 
 
 def _validated_physics_profile() -> str:
-    """Read E2E_PHYSICS_PROFILE from env, validate. Raises ValueError on invalid."""
-    value = os.environ.get("E2E_PHYSICS_PROFILE", "baseline")
+    """Read E2E_PHYSICS_PROFILE from env, validate. Raises ValueError on invalid.
+
+    Default: "realistic" (v10.4) — matches real hardware physics (no IGE
+    thrust gate, AGL gate 1-3cm). Tests without IGE (baseline profile) don't
+    model real propwash + ground effect, so they're not used by any built-in
+    target. baseline remains a valid value for ad-hoc diagnostic override.
+    """
+    value = os.environ.get("E2E_PHYSICS_PROFILE", "realistic")
     if value not in _VALID_PHYSICS_PROFILES:
         raise ValueError(
             f"E2E_PHYSICS_PROFILE={value!r} is not valid. "

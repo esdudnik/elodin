@@ -34,6 +34,13 @@ BETAFLIGHT_DIR="$REPO_ROOT/../betaflight"
 LOG_FILE="/tmp/bf-elodin.log"
 E2E_LOG_FILE="/tmp/bf-e2e.log"
 
+# v10.4: realistic IGE is the default physics profile. Tests without IGE
+# (baseline profile) don't model real hardware physics (no propwash, no
+# ground effect) — they're meaningless for production validation. baseline
+# remains a valid profile value for ad-hoc diagnostic comparison via env
+# var override, but no built-in target uses it.
+export E2E_PHYSICS_PROFILE="${E2E_PHYSICS_PROFILE:-realistic}"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -603,27 +610,35 @@ run_single_e2e() {
     return $rc2
 }
 
-# ── Focused suite for strict/realistic physics profile investigations ──
-# Used to reproduce real-hardware "floating" behavior under realistic IGE.
-# Tests are the ones strict_test.md identified as IGE-sensitive.
+# ── Focused suite for IGE-sensitive physics regression ──
+# Reproduces real-hardware "floating"/"moon takeoff" behavior under realistic
+# IGE. Used by `e2e-focused` target (defaults realistic, 5 cycles).
+# low-alt-horizontal added in v10.4 — tests spin-lock predicate during low-alt
+# flight, the scenario that caught v10.3.6→v10.3.7 sticky-snapshot regression.
 FOCUSED_TESTS=(
     "ground-idle:$E2E_GROUND_IDLE_SCRIPT"
     "nosettle-takeoff:$E2E_NOSETTLE_SCRIPT"
     "failsafe-althold:$E2E_FAILSAFE_SCRIPT"
     "failsafe-init:$E2E_FAILSAFE_INIT_SCRIPT"
     "midair-activation:$E2E_MIDAIR_SCRIPT"
+    "low-alt-horizontal:$E2E_LOW_ALT_HORIZONTAL_SCRIPT"
 )
 
-# ── Focused suite for wind investigations ──
-# Tests that exercise ALTHOLD altitude maintenance during XY disturbance.
-# Used with E2E_WIND_PROFILE={light,moderate,strong,gusty} to reproduce
-# real-hardware "ALTHOLD struggles in wind" symptoms. ground-idle is NOT
-# included here — it tests motor-stop predicate at idle, not altitude hold.
+# ── Wind suite (ALTHOLD) ──
+# Tests that exercise ALTHOLD behavior under XY wind disturbance — covers
+# both ground-arm scenarios (ground-idle: drone armed in wind) and flight
+# scenarios (angle/acro/failsafe/midair/low-alt). Used by `e2e-wind-althold`
+# target; defaults realistic physics + moderate wind, both overridable via
+# E2E_PHYSICS_PROFILE and E2E_WIND_PROFILE env vars.
+# v10.4: added ground-idle (real-hardware "arm in wind" matters) and
+# low-alt-horizontal (spin-lock predicate stress under wind perturbations).
 WIND_TESTS=(
+    "ground-idle:$E2E_GROUND_IDLE_SCRIPT"
     "angle-althold:$E2E_SCRIPT"
     "acro-althold:$E2E_ACRO_SCRIPT"
     "failsafe-althold:$E2E_FAILSAFE_SCRIPT"
     "midair-activation:$E2E_MIDAIR_SCRIPT"
+    "low-alt-horizontal:$E2E_LOW_ALT_HORIZONTAL_SCRIPT"
 )
 
 # ── POSHOLD wind suite ──
@@ -979,8 +994,8 @@ do_focused_suite() {
 #       $3 = suite display label (e.g. "ALTHOLD", "POSHOLD")
 #
 # Reads E2E_PHYSICS_PROFILE + E2E_WIND_PROFILE from env (validated in
-# config.py). Default physics=baseline, wind=moderate (if user didn't set —
-# we override here for "wind suite" semantics).
+# config.py). v10.4: physics defaults to realistic (set at script top); wind
+# defaults to moderate (set here for wind-suite semantics).
 #
 # Log path: /tmp/bf-e2e-${physics}_${wind}-${test}-r${N}.log
 # (combined profile prefix so wind runs don't overwrite physics-only runs)
@@ -991,12 +1006,10 @@ do_wind_suite() {
     local suite_label="${3:-wind}"
 
     # Default wind profile to "moderate" for wind-suite if not set by user.
-    # Default physics profile to whatever env says, fall back to baseline.
+    # Physics profile defaults to "realistic" (set at script top); preserved
+    # if user explicitly overrides via env var.
     if [ -z "${E2E_WIND_PROFILE:-}" ]; then
         export E2E_WIND_PROFILE="moderate"
-    fi
-    if [ -z "${E2E_PHYSICS_PROFILE:-}" ]; then
-        export E2E_PHYSICS_PROFILE="baseline"
     fi
     local physics="${E2E_PHYSICS_PROFILE}"
     local wind="${E2E_WIND_PROFILE}"
@@ -1179,6 +1192,7 @@ do_e2e_all() {
     else
         echo "  E2E TEST SUITE — $num_tests automated tests"
     fi
+    echo "  Effective physics profile: ${E2E_PHYSICS_PROFILE}"
     echo "========================================================================"
 
     local cycle=0
@@ -1512,11 +1526,15 @@ case "$MODE" in
     e2e-low-alt-horizontal)
         do_single_test_runs "$E2E_LOW_ALT_HORIZONTAL_SCRIPT" "low-alt-horizontal" "${2:-1}"
         ;;
-    e2e-strict)
-        do_focused_suite strict "${2:-1}"
+    e2e-all-strict)
+        # 12 tests (full set) under strict physics profile. Diagnostic lane —
+        # may show new failures under stricter IGE (use as non-blocking).
+        export E2E_PHYSICS_PROFILE=strict
+        do_e2e_all "${2:-1}"
         ;;
-    e2e-realistic)
-        do_focused_suite realistic "${2:-1}"
+    e2e-focused)
+        # IGE-sensitive focused 6 tests. Defaults to 5 cycles for confidence.
+        do_focused_suite "${E2E_PHYSICS_PROFILE}" "${2:-5}"
         ;;
     e2e-wind-althold)
         do_wind_suite WIND_TESTS "${2:-1}" "ALTHOLD"
@@ -1524,17 +1542,44 @@ case "$MODE" in
     e2e-wind-poshold)
         do_wind_suite WIND_POSHOLD_TESTS "${2:-1}" "POSHOLD"
         ;;
+    e2e-strict|e2e-realistic)
+        # v10.4: removed. Migration error.
+        echo "ERROR: '$1' was removed in v10.4." >&2
+        echo "" >&2
+        if [ "$1" = "e2e-strict" ]; then
+            echo "  - For ALL 12 tests under strict physics: use 'e2e-all-strict'" >&2
+            echo "  - For IGE-sensitive focused 6 under strict:" >&2
+            echo "      E2E_PHYSICS_PROFILE=strict ./run.sh e2e-focused" >&2
+        else
+            echo "  - For ALL 12 tests under realistic (now default): use 'e2e-all'" >&2
+            echo "  - For IGE-sensitive focused 6 under realistic: use 'e2e-focused'" >&2
+        fi
+        echo "" >&2
+        echo "  realistic is now the default physics profile for all targets." >&2
+        echo "  baseline remains available via env var override for ad-hoc diagnostic." >&2
+        exit 1
+        ;;
     check)
         do_check_logs
         ;;
     *)
         echo "Usage: ./run.sh [build-bf|rebuild-elodin|run|e2e-all|e2e-*|all|check]"
+        echo ""
+        echo "Build / run:"
         echo "  build-bf                              - clean + build betaflight SITL .elf"
         echo "  rebuild-elodin                        - rebuild elodin (Python SDK + editor binary)"
         echo "  run                                   - run editor (skip rebuild)"
-        echo "  e2e-all                   [N|--runs=N] - run ALL automated E2E tests sequentially, optionally N cycles"
+        echo "  all                                   - build-bf + rebuild-elodin + run (default)"
+        echo "  check                                 - analyze log file at $LOG_FILE"
         echo ""
-        echo "  Single-test targets (all accept optional [N|--runs=N] for multi-run + per-run logs):"
+        echo "E2E suites (all under realistic IGE physics by default):"
+        echo "  e2e-all          [N|--runs=N]         - ALL 12 automated tests (default 1 cycle)"
+        echo "  e2e-all-strict   [N|--runs=N]         - ALL 12 tests under strict IGE (diagnostic lane)"
+        echo "  e2e-focused      [N|--runs=N]         - 6 IGE-sensitive tests (default 5 cycles)"
+        echo "  e2e-wind-althold [N|--runs=N]         - 6 ALTHOLD tests under wind (default moderate)"
+        echo "  e2e-wind-poshold [N|--runs=N]         - POSHOLD wind drift test"
+        echo ""
+        echo "Single-test targets (all under realistic by default; accept [N|--runs=N]):"
         echo "  e2e-ground-idle           [N|--runs=N] - ground idle regression test"
         echo "  e2e-smooth-takeoff        [N|--runs=N] - smooth takeoff ramp test"
         echo "  e2e-manual-landing-safety [N|--runs=N] - manual touchdown anti-regression (low-pass + commit-land)"
@@ -1550,19 +1595,18 @@ case "$MODE" in
         echo "  e2e-low-alt-horizontal    [N|--runs=N] - low-altitude horizontal flight (spin-lock regression)"
         echo ""
         echo "  e2e-*-editor                          - any test above with 3D viewport (no multi-run)"
-        echo "  e2e-strict       [N|--runs=N]         - focused suite under strict physics profile, N runs"
-        echo "  e2e-realistic    [N|--runs=N]         - focused suite under realistic physics profile (no thrust gate, matches real hardware), N runs"
-        echo "  e2e-wind-althold [N|--runs=N]         - ALTHOLD suite under wind (angle, acro, failsafe-althold, midair), N runs"
-        echo "  e2e-wind-poshold [N|--runs=N]         - POSHOLD wind drift test, N runs"
-        echo "  all                                   - build-bf + rebuild-elodin + run (default)"
-        echo "  check                                 - analyze log file at $LOG_FILE"
         echo ""
-        echo "Environment variables:"
-        echo "  E2E_PHYSICS_PROFILE=baseline|strict|realistic (default: baseline)"
-        echo "                                        - IGE physics severity"
+        echo "Environment variables (override defaults):"
+        echo "  E2E_PHYSICS_PROFILE=baseline|strict|realistic (default: realistic)"
+        echo "                                        - IGE physics severity. baseline retained for ad-hoc"
+        echo "                                          diagnostic but no built-in target uses it."
         echo "  E2E_WIND_PROFILE=calm|light|moderate|strong|gusty (default: calm)"
         echo "                                        - ambient wind, gusty matches hardware test (2-5 m/s, 1-2s gusts)"
         echo "  Both can be set independently. e2e-wind-* targets default wind to 'moderate' if unset."
+        echo ""
+        echo "Removed targets (v10.4):"
+        echo "  e2e-strict          → use 'e2e-all-strict' or E2E_PHYSICS_PROFILE=strict ./run.sh e2e-focused"
+        echo "  e2e-realistic       → use 'e2e-all' (realistic is now default) or 'e2e-focused'"
         exit 1
         ;;
 esac

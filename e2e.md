@@ -57,10 +57,20 @@ Selectable via `E2E_PHYSICS_PROFILE` env (default `baseline`):
 
 Severity ordering: `baseline` < `strict` < `realistic`.
 
-**Focused suites** (5 IGE-sensitive tests: ground-idle, nosettle-takeoff, failsafe-althold, failsafe-init, midair-activation):
+**v10.4 default**: `realistic` is the default profile for all built-in targets.
+`baseline` remains a valid value for ad-hoc diagnostic override but no built-in
+target uses it (tests without IGE don't model real propwash + ground effect).
+
+**Focused suite** (6 IGE-sensitive tests: ground-idle, nosettle-takeoff,
+failsafe-althold, failsafe-init, midair-activation, low-alt-horizontal):
 ```bash
-./run.sh e2e-strict    [N|--runs=N]
-./run.sh e2e-realistic [N|--runs=N]
+./run.sh e2e-focused [N|--runs=N]                 # realistic + 5 cycles default
+E2E_PHYSICS_PROFILE=strict ./run.sh e2e-focused   # same suite under strict
+```
+
+**Full suite under strict** (12 tests — diagnostic lane, may show new failures):
+```bash
+./run.sh e2e-all-strict [N|--runs=N]
 ```
 
 ## Build & Run
@@ -83,19 +93,20 @@ source $NIX_SHELLRC
 ```
 
 ### Run a single test
+All targets default to realistic IGE physics.
 ```bash
 cd elodin/
-./run.sh e2e-ground-idle                                                  # baseline, 1 run
-./run.sh e2e-ground-idle --runs=10                                        # baseline, 10 runs
-E2E_PHYSICS_PROFILE=realistic ./run.sh e2e-midair-activation --runs=10    # realistic, 10 runs
+./run.sh e2e-ground-idle                                                  # realistic, 1 run
+./run.sh e2e-ground-idle --runs=10                                        # realistic, 10 runs
+E2E_PHYSICS_PROFILE=strict ./run.sh e2e-midair-activation --runs=10       # strict override
 ```
 
 ### Run full suite
 ```bash
-./run.sh e2e-all                                          # 11 tests, baseline, 1 cycle (~25 min)
-./run.sh e2e-all --runs=5                                 # 11 tests × 5 cycles = 55 runs (~125 min)
-E2E_PHYSICS_PROFILE=realistic ./run.sh e2e-all            # 11 tests under realistic
-./run.sh e2e-realistic --runs=10                          # focused 5 × 10 = 50 runs (~100 min)
+./run.sh e2e-all                                          # 12 tests, realistic, 1 cycle (~25 min)
+./run.sh e2e-all --runs=5                                 # 12 tests × 5 cycles = 60 runs (~125 min)
+./run.sh e2e-all-strict                                   # 12 tests under strict (diagnostic lane)
+./run.sh e2e-focused --runs=10                            # focused 6 × 10 = 60 runs (~115 min)
 ```
 
 ### Editor mode (3D viewport)
